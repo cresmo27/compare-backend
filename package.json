@@ -1,6 +1,6 @@
 {
-  "name": "compare-backend",
-  "version": "1.0.0",
+  "name": "compare-backend-pro",
+  "version": "1.2.0",
   "type": "module",
   "main": "server.js",
   "scripts": {
