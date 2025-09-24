@@ -1,250 +1,140 @@
-import express from "express";
-import cors from "cors";
-import dotenv from "dotenv";
+import express from 'express';
+import cors from 'cors';
+import morgan from 'morgan';
+import dotenv from 'dotenv';
+import fetch from 'node-fetch';
+import { RateLimiterMemory } from 'rate-limiter-flexible';
 
 dotenv.config();
 const app = express();
-app.use(cors());
-app.use(express.json({ limit: "1mb" }));
+const PORT = process.env.PORT || 10000;
+const ORIGIN = process.env.CORS_ORIGIN || '*';
+const FREE_DAILY_LIMIT = parseInt(process.env.FREE_DAILY_LIMIT || '3', 10);
 
-// ====== Config ======
-const {
-  PORT = 8080,
+app.use(cors({ origin: ORIGIN, credentials: false }));
+app.use(express.json({ limit: '1mb' }));
+app.use(morgan('tiny'));
 
-  // OpenAI
-  OPENAI_API_KEY,
-  OPENAI_MODEL = "gpt-4o-mini",
+const limiter = new RateLimiterMemory({
+  points: FREE_DAILY_LIMIT,
+  duration: 60 * 60 * 24,
+  keyPrefix: 'freeTier'
+});
 
-  // Gemini
-  GEMINI_API_KEY,
-  GEMINI_MODEL = "gemini-2.5-flash-lite",
-
-  // Claude (Anthropic)
-  ANTHROPIC_API_KEY,
-  ANTHROPIC_MODEL = "claude-3-5-sonnet-latest",
-  ANTHROPIC_MAX_TOKENS, // opcional, si no, usamos MAX_TOKENS_OUT
-
-  // Resumen
-  SUMMARY_PROVIDER = "gemini",
-
-  // Control de salida / temperatura
-  MAX_TOKENS_OUT = "350",
-  TEMP = "0.3",
-
-  // Control de planes
-  USERS_JSON = "{}",                // e.g. {"demo-free-123":"free","demo-pro-123":"pro"}
-  FREE_MAX_PROVIDERS = "2",
-  FREE_ALLOW_SUMMARY = "false",
-  FREE_DAILY_QUOTA = "50"
-} = process.env;
-
-const maxOut = parseInt(MAX_TOKENS_OUT, 10) || 350;
-const anthMax = parseInt(ANTHROPIC_MAX_TOKENS || MAX_TOKENS_OUT, 10) || 350;
-const temperature = Number(TEMP) || 0.3;
-const freeMaxProviders = parseInt(FREE_MAX_PROVIDERS, 10) || 2;
-const freeAllowSummary = (FREE_ALLOW_SUMMARY || "false").toLowerCase() === "true";
-const freeDailyQuota = parseInt(FREE_DAILY_QUOTA, 10) || 50;
-
-// In-memory usage counters (MVP)
-const usage = new Map();
-function todayKey() {
-  const d = new Date();
-  return d.toISOString().slice(0,10); // YYYY-MM-DD
+function getInstallId(req) {
+  return (req.headers['x-install-id'] || '').toString();
 }
-function getPlanFromToken(token) {
+
+app.get('/v1/health', (req, res) => res.json({ ok: true }));
+
+app.post('/v1/compare-multi', async (req, res) => {
   try {
-    const map = JSON.parse(USERS_JSON || "{}");
-    return map[token] || "free";
-  } catch {
-    return "free";
-  }
-}
-function checkAndCountQuota(token, plan) {
-  const key = (token || "anon") + "|" + todayKey();
-  const stat = usage.get(key) || { count: 0 };
-  if (plan === "free" && stat.count >= freeDailyQuota) {
-    return { ok: false, remaining: 0 };
-  }
-  stat.count += 1;
-  usage.set(key, stat);
-  const remaining = (plan === "free") ? Math.max(0, freeDailyQuota - stat.count) : Infinity;
-  return { ok: true, remaining };
-}
+    const installId = getInstallId(req);
+    if (!installId) return res.status(400).json({ error: 'Missing X-Install-ID header' });
+    try { await limiter.consume(installId, 1); }
+    catch { return res.status(429).json({ error: 'Free daily limit reached', quota: { remaining: 0 } }); }
 
-// Helper: timeout
-function fetchWithTimeout(url, options = {}, timeoutMs = 20000) {
-  const controller = new AbortController();
-  const id = setTimeout(() => controller.abort("timeout"), timeoutMs);
-  return fetch(url, { ...options, signal: controller.signal })
-    .finally(() => clearTimeout(id));
-}
-
-// ===================== Providers ===================== //
-async function askOpenAI(prompt) {
-  if (!OPENAI_API_KEY) throw new Error("Falta OPENAI_API_KEY");
-  const res = await fetchWithTimeout("https://api.openai.com/v1/responses", {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${OPENAI_API_KEY}`,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({
-      model: OPENAI_MODEL,
-      input: prompt,
-      max_output_tokens: maxOut,
-      temperature
-    })
-  });
-  if (!res.ok) throw new Error(`OpenAI ${res.status} ${await res.text()}`);
-  const data = await res.json();
-  const text = data.output_text ?? (data.output?.[0]?.content?.[0]?.text ?? "");
-  return text;
-}
-
-async function askGemini(prompt) {
-  if (!GEMINI_API_KEY) throw new Error("Falta GEMINI_API_KEY");
-  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
-  const res = await fetchWithTimeout(endpoint, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      contents: [{ role: "user", parts: [{ text: prompt }]}],
-      generationConfig: { maxOutputTokens: maxOut, temperature }
-    })
-  });
-  if (!res.ok) throw new Error(`Gemini ${res.status} ${await res.text()}`);
-  const data = await res.json();
-  const text = data?.candidates?.[0]?.content?.parts?.map(p => p.text).join("\n") ?? "";
-  return text || JSON.stringify(data);
-}
-
-// >>> NUEVO: Claude (Anthropic)
-async function askClaude(prompt) {
-  if (!ANTHROPIC_API_KEY) throw new Error("Falta ANTHROPIC_API_KEY");
-  const res = await fetchWithTimeout("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "x-api-key": ANTHROPIC_API_KEY,
-      "anthropic-version": "2023-06-01",
-      "content-type": "application/json"
-    },
-    body: JSON.stringify({
-      model: ANTHROPIC_MODEL,
-      max_tokens: anthMax,
-      messages: [{ role: "user", content: prompt }]
-    })
-  });
-  if (!res.ok) throw new Error(`Claude ${res.status} ${await res.text()}`);
-  const data = await res.json();
-  // data.content es un array de bloques; nos quedamos con los "text"
-  const text = Array.isArray(data?.content)
-    ? data.content.map(c => c?.text || "").join("\n")
-    : "";
-  return text || JSON.stringify(data);
-}
-// =================== /Providers ====================== //
-
-// Enforce plan rules
-function enforcePlan(plan, providers, doSummary) {
-  // prioridad: ajusta como prefieras
-  const ordered = ["openai","gemini","claude"];
-  const selected = ordered.filter(p => providers?.[p]);
-
-  let allowed = selected;
-  if (plan === "free" && selected.length > freeMaxProviders) {
-    allowed = selected.slice(0, freeMaxProviders);
-  }
-
-  const enforced = {
-    openai: allowed.includes("openai"),
-    gemini: allowed.includes("gemini"),
-    claude: allowed.includes("claude")
-  };
-
-  const allowSummary = (plan === "pro") ? doSummary : (freeAllowSummary && doSummary);
-  return { enforced, allowSummary };
-}
-
-// ======================= Routes ======================= //
-app.post("/compare", async (req, res) => {
-  try {
-    const token = req.headers["x-app-key"] || req.body?.appKey || "";
-    const plan = getPlanFromToken(token);
-    const quota = checkAndCountQuota(token, plan);
-    if (!quota.ok) {
-      return res.status(429).json({ error: "Daily quota exceeded (free plan).", plan, remaining: 0 });
+    const { prompt, models, temperature } = req.body || {};
+    if (!prompt || !Array.isArray(models) || models.length === 0) {
+      return res.status(400).json({ error: 'prompt and models[] required' });
     }
 
-    const {
-      prompt,
-      providers = { openai:true, gemini:true, claude:true },
-      doSummary = false
-    } = req.body || {};
-    if (!prompt) return res.status(400).json({ error: "Falta 'prompt'", plan, remaining: quota.remaining });
-
-    const { enforced, allowSummary } = enforcePlan(plan, providers, doSummary);
-
-    const results = [];
-    const tasks = [];
-
-    if (enforced.openai) {
-      tasks.push(
-        askOpenAI(prompt)
-          .then(text => results.push({ provider: "OpenAI", text }))
-          .catch(err => results.push({ provider: "OpenAI", error: String(err.message || err) }))
-      );
-    }
-    if (enforced.gemini) {
-      tasks.push(
-        askGemini(prompt)
-          .then(text => results.push({ provider: "Gemini", text }))
-          .catch(err => results.push({ provider: "Gemini", error: String(err.message || err) }))
-      );
-    }
-    if (enforced.claude) {
-      tasks.push(
-        askClaude(prompt)
-          .then(text => results.push({ provider: "Claude", text }))
-          .catch(err => results.push({ provider: "Claude", error: String(err.message || err) }))
-      );
-    }
-
-    await Promise.all(tasks);
-
-    let summary = "";
-    if (allowSummary && results.length) {
-      const joined = results.map(r => `### ${r.provider}\n${r.text || r.error || ""}`).join("\n\n");
-      const sumPrompt = `Resume en 3 viñetas (máx 80 palabras) coincidencias y diferencias, neutro y conciso.\n\n${joined}`;
-      try {
-        const sp = (SUMMARY_PROVIDER || "gemini").toLowerCase();
-        if (sp === "gemini") summary = await askGemini(sumPrompt);
-        else if (sp === "openai") summary = await askOpenAI(sumPrompt);
-        else if (sp === "claude") summary = await askClaude(sumPrompt);
-        else summary = await askGemini(sumPrompt);
-      } catch {
-        summary = "No se pudo generar resumen.";
+    const tasks = models.map(async (m) => {
+      switch (m) {
+        case 'openai': return ['openai', await callOpenAI(prompt, temperature)];
+        case 'claude': return ['claude', await callClaude(prompt, temperature)];
+        case 'gemini': return ['gemini', await callGemini(prompt, temperature)];
+        default: return [m, '(modelo desconocido)'];
       }
-    }
-
-    res.json({
-      plan,
-      remaining: quota.remaining,
-      providers_enforced: enforced,
-      results,
-      summary
     });
+
+    const entries = await Promise.all(tasks);
+    const outputs = Object.fromEntries(entries);
+
+    const rl = await limiter.get(installId);
+    const remaining = Math.max(0, (rl && rl.remainingPoints) ?? 0);
+
+    res.json({ outputs, quota: { remaining } });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: String(err.message || err) });
+    res.status(500).send('Server error');
   }
 });
 
-app.get("/health", (_, res) => res.json({ ok: true }));
-app.get("/me", (req, res) => {
-  const token = req.headers["x-app-key"] || "";
-  const plan = getPlanFromToken(token);
-  const quota = checkAndCountQuota(token, plan); // cuenta una consulta simple
-  res.json({ plan, remaining: quota.remaining });
+// (Opcional) Single model endpoint
+app.post('/v1/compare', async (req, res) => {
+  try {
+    const installId = getInstallId(req);
+    if (!installId) return res.status(400).json({ error: 'Missing X-Install-ID header' });
+    try { await limiter.consume(installId, 1); }
+    catch { return res.status(429).json({ error: 'Free daily limit reached', quota: { remaining: 0 } }); }
+
+    const { prompt, model, temperature } = req.body || {};
+    if (!prompt || !model) return res.status(400).json({ error: 'prompt and model required' });
+
+    let out = '';
+    switch (model) {
+      case 'openai': out = await callOpenAI(prompt, temperature); break;
+      case 'claude': out = await callClaude(prompt, temperature); break;
+      case 'gemini': out = await callGemini(prompt, temperature); break;
+      default: return res.status(400).json({ error: 'unknown model' });
+    }
+
+    const rl = await limiter.get(installId);
+    const remaining = Math.max(0, (rl && rl.remainingPoints) ?? 0);
+    res.json({ output: out, quota: { remaining } });
+  } catch (err) {
+    console.error(err);
+    res.status(500).send('Server error');
+  }
 });
 
-app.listen(PORT, () => console.log(`✅ compare-backend-pro en http://localhost:${PORT}`));
+async function callOpenAI(prompt, temperature=1) {
+  const key = process.env.OPENAI_API_KEY;
+  if (!key) throw new Error('OPENAI_API_KEY not set');
+  const body = {
+    model: "gpt-4o-mini",
+    messages: [{ role: "user", content: prompt }],
+    temperature: Number.isFinite(+temperature) ? +temperature : 1
+  };
+  const resp = await fetch('https://api.openai.com/v1/chat/completions', {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+  if (!resp.ok) { throw new Error(`OpenAI error ${resp.status}: ${await resp.text()}`); }
+  const data = await resp.json();
+  return data.choices?.[0]?.message?.content || '';
+}
+
+async function callClaude(prompt, temperature=1) {
+  const key = process.env.ANTHROPIC_API_KEY;
+  if (!key) throw new Error('ANTHROPIC_API_KEY not set');
+  const body = {
+    model: "claude-3-haiku-20240307",
+    max_tokens: 512,
+    temperature: Number.isFinite(+temperature) ? +temperature : 1,
+    messages: [{ role: "user", content: prompt }]
+  };
+  const resp = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: { 'x-api-key': key, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+  if (!resp.ok) { throw new Error(`Anthropic error ${resp.status}: ${await resp.text()}`); }
+  const data = await resp.json();
+  return data.content?.[0]?.text || '';
+}
+
+async function callGemini(prompt, temperature=1) {
+  const key = process.env.GOOGLE_API_KEY;
+  if (!key) throw new Error('GOOGLE_API_KEY not set');
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${key}`;
+  const body = { contents: [{ parts: [{ text: prompt }] }], generationConfig: { temperature: Number.isFinite(+temperature) ? +temperature : 1 } };
+  const resp = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+  if (!resp.ok) { throw new Error(`Gemini error ${resp.status}: ${await resp.text()}`); }
+  const data = await resp.json();
+  return data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+}
+
+app.listen(PORT, () => console.log(`API listening on http://localhost:${PORT}`));
