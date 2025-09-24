@@ -187,6 +187,10 @@ async function callGemini(prompt, temperature = 1) {
   const data = await resp.json();
   return data.candidates?.[0]?.content?.parts?.[0]?.text || '';
 }
+// --- TEST: POST simple para verificar rutas POST ---
+app.post('/v1/ping', (req, res) => {
+  res.json({ ok: true, got: req.body || null });
+});
 
 /* --------------------------------- Start --------------------------------- */
 app.listen(PORT, () => {
