@@ -10,13 +10,28 @@ app.use(express.json({ limit: "1mb" }));
 // ====== Config ======
 const {
   PORT = 8080,
+
+  // OpenAI
   OPENAI_API_KEY,
   OPENAI_MODEL = "gpt-4o-mini",
+
+  // Gemini
   GEMINI_API_KEY,
   GEMINI_MODEL = "gemini-2.5-flash-lite",
+
+  // Claude (Anthropic)
+  ANTHROPIC_API_KEY,
+  ANTHROPIC_MODEL = "claude-3-5-sonnet-latest",
+  ANTHROPIC_MAX_TOKENS, // opcional, si no, usamos MAX_TOKENS_OUT
+
+  // Resumen
   SUMMARY_PROVIDER = "gemini",
+
+  // Control de salida / temperatura
   MAX_TOKENS_OUT = "350",
   TEMP = "0.3",
+
+  // Control de planes
   USERS_JSON = "{}",                // e.g. {"demo-free-123":"free","demo-pro-123":"pro"}
   FREE_MAX_PROVIDERS = "2",
   FREE_ALLOW_SUMMARY = "false",
@@ -24,6 +39,7 @@ const {
 } = process.env;
 
 const maxOut = parseInt(MAX_TOKENS_OUT, 10) || 350;
+const anthMax = parseInt(ANTHROPIC_MAX_TOKENS || MAX_TOKENS_OUT, 10) || 350;
 const temperature = Number(TEMP) || 0.3;
 const freeMaxProviders = parseInt(FREE_MAX_PROVIDERS, 10) || 2;
 const freeAllowSummary = (FREE_ALLOW_SUMMARY || "false").toLowerCase() === "true";
@@ -63,7 +79,7 @@ function fetchWithTimeout(url, options = {}, timeoutMs = 20000) {
     .finally(() => clearTimeout(id));
 }
 
-// Providers
+// ===================== Providers ===================== //
 async function askOpenAI(prompt) {
   if (!OPENAI_API_KEY) throw new Error("Falta OPENAI_API_KEY");
   const res = await fetchWithTimeout("https://api.openai.com/v1/responses", {
@@ -84,6 +100,7 @@ async function askOpenAI(prompt) {
   const text = data.output_text ?? (data.output?.[0]?.content?.[0]?.text ?? "");
   return text;
 }
+
 async function askGemini(prompt) {
   if (!GEMINI_API_KEY) throw new Error("Falta GEMINI_API_KEY");
   const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
@@ -101,22 +118,54 @@ async function askGemini(prompt) {
   return text || JSON.stringify(data);
 }
 
+// >>> NUEVO: Claude (Anthropic)
+async function askClaude(prompt) {
+  if (!ANTHROPIC_API_KEY) throw new Error("Falta ANTHROPIC_API_KEY");
+  const res = await fetchWithTimeout("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "x-api-key": ANTHROPIC_API_KEY,
+      "anthropic-version": "2023-06-01",
+      "content-type": "application/json"
+    },
+    body: JSON.stringify({
+      model: ANTHROPIC_MODEL,
+      max_tokens: anthMax,
+      messages: [{ role: "user", content: prompt }]
+    })
+  });
+  if (!res.ok) throw new Error(`Claude ${res.status} ${await res.text()}`);
+  const data = await res.json();
+  // data.content es un array de bloques; nos quedamos con los "text"
+  const text = Array.isArray(data?.content)
+    ? data.content.map(c => c?.text || "").join("\n")
+    : "";
+  return text || JSON.stringify(data);
+}
+// =================== /Providers ====================== //
+
 // Enforce plan rules
 function enforcePlan(plan, providers, doSummary) {
-  const ordered = ["openai","gemini"]; // prioridad en MVP
+  // prioridad: ajusta como prefieras
+  const ordered = ["openai","gemini","claude"];
   const selected = ordered.filter(p => providers?.[p]);
+
   let allowed = selected;
   if (plan === "free" && selected.length > freeMaxProviders) {
     allowed = selected.slice(0, freeMaxProviders);
   }
+
   const enforced = {
     openai: allowed.includes("openai"),
-    gemini: allowed.includes("gemini")
+    gemini: allowed.includes("gemini"),
+    claude: allowed.includes("claude")
   };
+
   const allowSummary = (plan === "pro") ? doSummary : (freeAllowSummary && doSummary);
   return { enforced, allowSummary };
 }
 
+// ======================= Routes ======================= //
 app.post("/compare", async (req, res) => {
   try {
     const token = req.headers["x-app-key"] || req.body?.appKey || "";
@@ -126,13 +175,18 @@ app.post("/compare", async (req, res) => {
       return res.status(429).json({ error: "Daily quota exceeded (free plan).", plan, remaining: 0 });
     }
 
-    const { prompt, providers = { openai:true, gemini:true }, doSummary = false } = req.body || {};
+    const {
+      prompt,
+      providers = { openai:true, gemini:true, claude:true },
+      doSummary = false
+    } = req.body || {};
     if (!prompt) return res.status(400).json({ error: "Falta 'prompt'", plan, remaining: quota.remaining });
 
     const { enforced, allowSummary } = enforcePlan(plan, providers, doSummary);
 
     const results = [];
     const tasks = [];
+
     if (enforced.openai) {
       tasks.push(
         askOpenAI(prompt)
@@ -147,6 +201,14 @@ app.post("/compare", async (req, res) => {
           .catch(err => results.push({ provider: "Gemini", error: String(err.message || err) }))
       );
     }
+    if (enforced.claude) {
+      tasks.push(
+        askClaude(prompt)
+          .then(text => results.push({ provider: "Claude", text }))
+          .catch(err => results.push({ provider: "Claude", error: String(err.message || err) }))
+      );
+    }
+
     await Promise.all(tasks);
 
     let summary = "";
@@ -154,11 +216,11 @@ app.post("/compare", async (req, res) => {
       const joined = results.map(r => `### ${r.provider}\n${r.text || r.error || ""}`).join("\n\n");
       const sumPrompt = `Resume en 3 viñetas (máx 80 palabras) coincidencias y diferencias, neutro y conciso.\n\n${joined}`;
       try {
-        if ((SUMMARY_PROVIDER || "gemini").toLowerCase() === "gemini") {
-          summary = await askGemini(sumPrompt);
-        } else {
-          summary = await askOpenAI(sumPrompt);
-        }
+        const sp = (SUMMARY_PROVIDER || "gemini").toLowerCase();
+        if (sp === "gemini") summary = await askGemini(sumPrompt);
+        else if (sp === "openai") summary = await askOpenAI(sumPrompt);
+        else if (sp === "claude") summary = await askClaude(sumPrompt);
+        else summary = await askGemini(sumPrompt);
       } catch {
         summary = "No se pudo generar resumen.";
       }
