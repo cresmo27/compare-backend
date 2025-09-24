@@ -3,7 +3,6 @@ import cors from 'cors';
 import morgan from 'morgan';
 import dotenv from 'dotenv';
 import fetch from 'node-fetch';
-import { RateLimiterMemory } from 'rate-limiter-flexible';
 
 dotenv.config();
 const app = express();
@@ -15,30 +14,51 @@ app.use(cors({ origin: ORIGIN, credentials: false }));
 app.use(express.json({ limit: '1mb' }));
 app.use(morgan('tiny'));
 
-const limiter = new RateLimiterMemory({
-  points: FREE_DAILY_LIMIT,
-  duration: 60 * 60 * 24,
-  keyPrefix: 'freeTier'
-});
-
+// --- Limitador diario simple en memoria (por X-Install-ID) ---
+const buckets = new Map(); // installId -> { count, resetAt }
+function utcMidnightResetTs() {
+  const d = new Date();
+  d.setUTCHours(24, 0, 0, 0); // resetea a medianoche UTC
+  return d.getTime();
+}
+function checkAndConsume(installId) {
+  const now = Date.now();
+  const b = buckets.get(installId);
+  if (!b || now > b.resetAt) {
+    buckets.set(installId, { count: 1, resetAt: utcMidnightResetTs() });
+    return { remaining: Math.max(0, FREE_DAILY_LIMIT - 1) };
+  }
+  if (b.count >= FREE_DAILY_LIMIT) {
+    return { remaining: 0, limited: true };
+  }
+  b.count += 1;
+  return { remaining: Math.max(0, FREE_DAILY_LIMIT - b.count) };
+}
+function getRemaining(installId) {
+  const b = buckets.get(installId);
+  if (!b) return FREE_DAILY_LIMIT;
+  return Math.max(0, FREE_DAILY_LIMIT - b.count);
+}
 function getInstallId(req) {
   return (req.headers['x-install-id'] || '').toString();
 }
 
+// Salud
 app.get('/v1/health', (req, res) => res.json({ ok: true }));
 
+// Comparar varias IAs
 app.post('/v1/compare-multi', async (req, res) => {
+  const installId = getInstallId(req);
+  if (!installId) return res.status(400).json({ error: 'Missing X-Install-ID header' });
+
+  const limit = checkAndConsume(installId);
+  if (limit.limited) return res.status(429).json({ error: 'Free daily limit reached', quota: { remaining: 0 } });
+
+  const { prompt, models, temperature } = req.body || {};
+  if (!prompt || !Array.isArray(models) || models.length === 0) {
+    return res.status(400).json({ error: 'prompt and models[] required' });
+  }
   try {
-    const installId = getInstallId(req);
-    if (!installId) return res.status(400).json({ error: 'Missing X-Install-ID header' });
-    try { await limiter.consume(installId, 1); }
-    catch { return res.status(429).json({ error: 'Free daily limit reached', quota: { remaining: 0 } }); }
-
-    const { prompt, models, temperature } = req.body || {};
-    if (!prompt || !Array.isArray(models) || models.length === 0) {
-      return res.status(400).json({ error: 'prompt and models[] required' });
-    }
-
     const tasks = models.map(async (m) => {
       switch (m) {
         case 'openai': return ['openai', await callOpenAI(prompt, temperature)];
@@ -47,31 +67,26 @@ app.post('/v1/compare-multi', async (req, res) => {
         default: return [m, '(modelo desconocido)'];
       }
     });
-
     const entries = await Promise.all(tasks);
     const outputs = Object.fromEntries(entries);
-
-    const rl = await limiter.get(installId);
-    const remaining = Math.max(0, (rl && rl.remainingPoints) ?? 0);
-
-    res.json({ outputs, quota: { remaining } });
+    res.json({ outputs, quota: { remaining: getRemaining(installId) } });
   } catch (err) {
     console.error(err);
     res.status(500).send('Server error');
   }
 });
 
-// (Opcional) Single model endpoint
+// Comparar una sola IA (opcional)
 app.post('/v1/compare', async (req, res) => {
+  const installId = getInstallId(req);
+  if (!installId) return res.status(400).json({ error: 'Missing X-Install-ID header' });
+
+  const limit = checkAndConsume(installId);
+  if (limit.limited) return res.status(429).json({ error: 'Free daily limit reached', quota: { remaining: 0 } });
+
+  const { prompt, model, temperature } = req.body || {};
+  if (!prompt || !model) return res.status(400).json({ error: 'prompt and model required' });
   try {
-    const installId = getInstallId(req);
-    if (!installId) return res.status(400).json({ error: 'Missing X-Install-ID header' });
-    try { await limiter.consume(installId, 1); }
-    catch { return res.status(429).json({ error: 'Free daily limit reached', quota: { remaining: 0 } }); }
-
-    const { prompt, model, temperature } = req.body || {};
-    if (!prompt || !model) return res.status(400).json({ error: 'prompt and model required' });
-
     let out = '';
     switch (model) {
       case 'openai': out = await callOpenAI(prompt, temperature); break;
@@ -79,16 +94,15 @@ app.post('/v1/compare', async (req, res) => {
       case 'gemini': out = await callGemini(prompt, temperature); break;
       default: return res.status(400).json({ error: 'unknown model' });
     }
-
-    const rl = await limiter.get(installId);
-    const remaining = Math.max(0, (rl && rl.remainingPoints) ?? 0);
-    res.json({ output: out, quota: { remaining } });
+    res.json({ output: out, quota: { remaining: getRemaining(installId) } });
   } catch (err) {
     console.error(err);
     res.status(500).send('Server error');
   }
 });
 
+// --- Llamadas a proveedores ---
+// OpenAI
 async function callOpenAI(prompt, temperature=1) {
   const key = process.env.OPENAI_API_KEY;
   if (!key) throw new Error('OPENAI_API_KEY not set');
@@ -102,11 +116,12 @@ async function callOpenAI(prompt, temperature=1) {
     headers: { 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json' },
     body: JSON.stringify(body)
   });
-  if (!resp.ok) { throw new Error(`OpenAI error ${resp.status}: ${await resp.text()}`); }
+  if (!resp.ok) throw new Error(`OpenAI error ${resp.status}: ${await resp.text()}`);
   const data = await resp.json();
   return data.choices?.[0]?.message?.content || '';
 }
 
+// Anthropic (Claude)
 async function callClaude(prompt, temperature=1) {
   const key = process.env.ANTHROPIC_API_KEY;
   if (!key) throw new Error('ANTHROPIC_API_KEY not set');
@@ -118,21 +133,33 @@ async function callClaude(prompt, temperature=1) {
   };
   const resp = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
-    headers: { 'x-api-key': key, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
+    headers: {
+      'x-api-key': key,
+      'anthropic-version': '2023-06-01',
+      'content-type': 'application/json'
+    },
     body: JSON.stringify(body)
   });
-  if (!resp.ok) { throw new Error(`Anthropic error ${resp.status}: ${await resp.text()}`); }
+  if (!resp.ok) throw new Error(`Anthropic error ${resp.status}: ${await resp.text()}`);
   const data = await resp.json();
   return data.content?.[0]?.text || '';
 }
 
+// Google Gemini
 async function callGemini(prompt, temperature=1) {
   const key = process.env.GOOGLE_API_KEY;
   if (!key) throw new Error('GOOGLE_API_KEY not set');
   const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${key}`;
-  const body = { contents: [{ parts: [{ text: prompt }] }], generationConfig: { temperature: Number.isFinite(+temperature) ? +temperature : 1 } };
-  const resp = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
-  if (!resp.ok) { throw new Error(`Gemini error ${resp.status}: ${await resp.text()}`); }
+  const body = {
+    contents: [{ parts: [{ text: prompt }] }],
+    generationConfig: { temperature: Number.isFinite(+temperature) ? +temperature : 1 }
+  };
+  const resp = await fetch(url, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+  if (!resp.ok) throw new Error(`Gemini error ${resp.status}: ${await resp.text()}`);
   const data = await resp.json();
   return data.candidates?.[0]?.content?.parts?.[0]?.text || '';
 }
