@@ -1,8 +1,9 @@
 // server.js — Multi-IA Compare backend (OpenAI / Claude / Gemini)
-// - /v1/health
-// - /v1/compare-multi  { prompt, models:["openai","claude","gemini"], temperature }
-// - /v1/compare        { prompt, model, temperature }
-// Claves en variables de entorno (Render): OPENAI_API_KEY, ANTHROPIC_API_KEY, GOOGLE_API_KEY
+// Rutas:
+//   GET  /v1/health
+//   POST /v1/compare-multi  { prompt, models:["openai","claude","gemini"], temperature }
+//   POST /v1/compare        { prompt, model, temperature }
+// Vars de entorno (Render): OPENAI_API_KEY, ANTHROPIC_API_KEY, GOOGLE_API_KEY
 // CORS_ORIGIN="*" para pruebas. FREE_DAILY_LIMIT ajustable.
 // Nota: limitador diario simple en memoria (se reinicia al redeploy).
 
