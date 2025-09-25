@@ -209,51 +209,67 @@ app.get("/v1/debug-routes", (_req, res) => {
  *   "temperature": 0.0 - 1.0 (opcional)
  * }
  */
-app.post("/v1/compare", async (req, res) => {
+app.post("/v1/compare-multi", async (req, res) => {
   try {
-    const { provider, prompt, model, temperature } = req.body || {};
-    if (!provider || !PROVIDERS.includes(String(provider).toLowerCase())) {
-      return httpError(res, 400, `provider inválido. Usa: ${PROVIDERS.join(", ")}`);
+    const { providers, prompt, perProviderOptions } = req.body || {};
+
+    if (!Array.isArray(providers) || providers.length === 0) {
+      return httpError(res, 400, "providers requerido (array con al menos un proveedor)");
+    }
+    const normalized = providers.map((p) => String(p).toLowerCase()).filter((p) => PROVIDERS.includes(p));
+    if (normalized.length === 0) {
+      return httpError(res, 400, `providers inválidos. Soportados: ${PROVIDERS.join(", ")}`);
     }
     if (!prompt || typeof prompt !== "string") {
       return httpError(res, 400, "prompt requerido (string)");
     }
 
-    const selectedModel = pickModel(String(provider).toLowerCase(), model);
-    const temp = typeof temperature === "number" ? temperature : 0.2;
-
-    const controller = new AbortController();
     const t0 = getNowMs();
 
-    try {
-      const result = await withTimeout(
-        callProvider({
-          provider,
-          prompt,
-          model: selectedModel,
-          temperature: temp,
-          signal: controller.signal,
-        }),
-        30000,
-        controller
-      );
+    const tasks = normalized.map(async (p) => {
+      const opts = (perProviderOptions && perProviderOptions[p]) || {};
+      const model = pickModel(p, opts.model);
+      const temperature = typeof opts.temperature === "number" ? opts.temperature : 0.2;
 
-      const latencyMs = Math.round(getNowMs() - t0);
-      return res.json({
-        ok: true,
-        provider: String(provider).toLowerCase(),
-        model: selectedModel,
-        latencyMs,
-        output: result.output,
-        usage: result.usage ?? null,
-      });
-    } catch (err) {
-      return httpError(res, 502, `Error llamando a ${provider}: ${(err && err.message) || err}`);
-    }
+      // 👇 AbortController por proveedor (no compartido)
+      const controller = new AbortController();
+      // timeouts ligeramente distintos; Gemini a 45s
+      const timeoutMs = p === "gemini" ? 45000 : 35000;
+
+      const pStart = getNowMs();
+      try {
+        const result = await withTimeout(
+          callProvider({ provider: p, prompt, model, temperature, signal: controller.signal }),
+          timeoutMs,
+          controller
+        );
+        return {
+          ok: true,
+          provider: p,
+          model,
+          latencyMs: Math.round(getNowMs() - pStart),
+          output: result.output,
+          usage: result.usage ?? null,
+        };
+      } catch (err) {
+        return {
+          ok: false,
+          provider: p,
+          model,
+          latencyMs: Math.round(getNowMs() - pStart),
+          error: (err && err.message) || String(err),
+        };
+      }
+    });
+
+    const results = await Promise.all(tasks);
+    const totalMs = Math.round(getNowMs() - t0);
+    return res.json({ ok: true, totalLatencyMs: totalMs, results });
   } catch (e) {
-    return httpError(res, 500, "Error interno en /v1/compare", { detail: String(e?.message || e) });
+    return httpError(res, 500, "Error interno en /v1/compare-multi", { detail: String(e?.message || e) });
   }
 });
+
 
 // ---------- /v1/compare-multi ----------
 /**
