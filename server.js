@@ -1,198 +1,338 @@
-// server.js — Multi-IA Compare backend (OpenAI / Claude / Gemini)
-// Rutas:
-//   GET  /v1/health
-//   POST /v1/compare-multi  { prompt, models:["openai","claude","gemini"], temperature }
-//   POST /v1/compare        { prompt, model, temperature }
-// Vars de entorno (Render): OPENAI_API_KEY, ANTHROPIC_API_KEY, GOOGLE_API_KEY
-// CORS_ORIGIN="*" para pruebas. FREE_DAILY_LIMIT ajustable.
-// Nota: limitador diario simple en memoria (se reinicia al redeploy).
+// server.js
+// Backend ligero para Comparador de IAs
+// Proveedores soportados: openai, claude, gemini
 
-import express from 'express';
-import cors from 'cors';
-import morgan from 'morgan';
-import dotenv from 'dotenv';
-import fetch from 'node-fetch';
+import express from "express";
+import cors from "cors";
 
-dotenv.config();
+// Node 18+ trae fetch y AbortController nativos.
+// Si ejecutas en un entorno sin fetch, descomenta esta línea:
+// const fetch = (await import("node-fetch")).default;
 
 const app = express();
-const PORT = process.env.PORT || 10000;
-const ORIGIN = process.env.CORS_ORIGIN || '*';
-const FREE_DAILY_LIMIT = parseInt(process.env.FREE_DAILY_LIMIT || '3', 10);
 
-app.use(cors({ origin: ORIGIN, credentials: false }));
-app.use(express.json({ limit: '1mb' }));
-app.use(morgan('tiny'));
+// ---------- Middlewares ----------
+app.use(cors({ origin: true })); // Permite llamadas desde la extensión
+app.use(express.json({ limit: "1mb" }));
 
-/* -------------------- Limitador diario simple (por instalación) -------------------- */
-const buckets = new Map(); // installId -> { count, resetAt }
-function nextUtcMidnightTs() {
-  const d = new Date();
-  d.setUTCHours(24, 0, 0, 0); // resetea a medianoche UTC
-  return d.getTime();
+// ---------- Utilidades ----------
+const PROVIDERS = ["openai", "claude", "gemini"];
+
+const DEFAULT_MODELS = {
+  openai: "gpt-4o-mini",
+  claude: "claude-3-haiku-20240307",
+  gemini: "gemini-1.5-flash",
+};
+
+function pickModel(provider, requested) {
+  if (requested && typeof requested === "string" && requested.trim()) return requested.trim();
+  return DEFAULT_MODELS[provider];
 }
-function consumePoint(installId) {
-  if (!installId) return { remaining: 0, limited: true };
-  const now = Date.now();
-  const b = buckets.get(installId);
-  if (!b || now > b.resetAt) {
-    buckets.set(installId, { count: 1, resetAt: nextUtcMidnightTs() });
-    return { remaining: Math.max(0, FREE_DAILY_LIMIT - 1) };
+
+function getNowMs() {
+  return performance?.now?.() ?? Date.now();
+}
+
+function httpError(res, code, message, extra = {}) {
+  return res.status(code).json({ ok: false, error: message, ...extra });
+}
+
+async function withTimeout(promise, ms, abortController) {
+  const timeout = new Promise((_, reject) =>
+    setTimeout(() => {
+      try { abortController?.abort?.(); } catch {}
+      reject(new Error(`timeout after ${ms}ms`));
+    }, ms)
+  );
+  return Promise.race([promise, timeout]);
+}
+
+// ---------- Proveedores ----------
+async function callOpenAI({ prompt, model, temperature = 0.2, signal }) {
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) throw new Error("OPENAI_API_KEY no configurada");
+
+  const url = "https://api.openai.com/v1/chat/completions";
+  const body = {
+    model: model || DEFAULT_MODELS.openai,
+    messages: [{ role: "user", content: prompt }],
+    temperature,
+  };
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+    signal,
+  });
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`OpenAI ${res.status}: ${text}`);
   }
-  if (b.count >= FREE_DAILY_LIMIT) return { remaining: 0, limited: true };
-  b.count += 1;
-  return { remaining: Math.max(0, FREE_DAILY_LIMIT - b.count) };
-}
-function getRemaining(installId) {
-  const b = buckets.get(installId);
-  return b ? Math.max(0, FREE_DAILY_LIMIT - b.count) : FREE_DAILY_LIMIT;
-}
-function getInstallId(req) {
-  return (req.headers['x-install-id'] || '').toString();
+
+  const data = await res.json();
+  const message = data?.choices?.[0]?.message?.content ?? "";
+  const usage = data?.usage ?? null;
+
+  return { output: message, usage };
 }
 
-/* ----------------------------------- Rutas ----------------------------------- */
+async function callAnthropic({ prompt, model, temperature = 0.2, signal }) {
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) throw new Error("ANTHROPIC_API_KEY no configurada");
 
-// Salud
-app.get('/v1/health', (_req, res) => res.json({ ok: true }));
+  const url = "https://api.anthropic.com/v1/messages";
+  const body = {
+    model: model || DEFAULT_MODELS.claude,
+    max_tokens: 1024,
+    temperature,
+    messages: [{ role: "user", content: prompt }],
+  };
 
-// Comparativa MULTI
-app.post('/v1/compare-multi', async (req, res) => {
-  const installId = getInstallId(req);
-  if (!installId) return res.status(400).json({ error: 'Missing X-Install-ID header' });
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      "x-api-key": apiKey,
+      "anthropic-version": "2023-06-01",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+    signal,
+  });
 
-  const limit = consumePoint(installId);
-  if (limit.limited) return res.status(429).json({ error: 'Free daily limit reached', quota: { remaining: 0 } });
-
-  const { prompt, models, temperature } = req.body || {};
-  if (!prompt || !Array.isArray(models) || models.length === 0) {
-    return res.status(400).json({ error: 'prompt and models[] required' });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`Anthropic ${res.status}: ${text}`);
   }
 
+  const data = await res.json();
+  // Claude v1/messages responde con .content como array de bloques
+  const output =
+    Array.isArray(data?.content)
+      ? data.content.map((b) => (typeof b?.text === "string" ? b.text : "")).join("\n")
+      : "";
+
+  return { output, usage: data?.usage ?? null };
+}
+
+async function callGemini({ prompt, model, temperature = 0.2, signal }) {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) throw new Error("GEMINI_API_KEY no configurada");
+
+  const mdl = model || DEFAULT_MODELS.gemini;
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
+    mdl
+  )}:generateContent?key=${encodeURIComponent(apiKey)}`;
+
+  const body = {
+    contents: [
+      {
+        role: "user",
+        parts: [{ text: prompt }],
+      },
+    ],
+    generationConfig: {
+      temperature,
+      maxOutputTokens: 1024,
+    },
+  };
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+    signal,
+  });
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`Gemini ${res.status}: ${text}`);
+  }
+
+  const data = await res.json();
+  const output =
+    data?.candidates?.[0]?.content?.parts
+      ?.map((p) => (typeof p?.text === "string" ? p.text : ""))
+      .join("\n") ?? "";
+
+  return { output, usage: data?.usageMetadata ?? null };
+}
+
+async function callProvider({ provider, prompt, model, temperature, signal }) {
+  const p = provider.toLowerCase();
+  if (p === "openai") return callOpenAI({ prompt, model, temperature, signal });
+  if (p === "claude") return callAnthropic({ prompt, model, temperature, signal });
+  if (p === "gemini") return callGemini({ prompt, model, temperature, signal });
+  throw new Error(`Proveedor no soportado: ${provider}`);
+}
+
+// ---------- Rutas de salud ----------
+app.get("/", (_req, res) => res.json({ ok: true, tag: "root" }));
+app.get("/health", (_req, res) => res.json({ ok: true, tag: "health" }));
+app.get("/v1/health", (_req, res) => res.json({ ok: true, tag: "health-v1" }));
+
+// ---------- Debug: listar rutas ----------
+app.get("/v1/debug-routes", (_req, res) => {
+  const routes = [];
+  app._router.stack.forEach((middleware) => {
+    if (middleware.route) {
+      const methods = Object.keys(middleware.route.methods)
+        .filter((m) => middleware.route.methods[m])
+        .map((m) => m.toUpperCase());
+      routes.push({ methods, path: middleware.route.path });
+    } else if (middleware.name === "router" && middleware.handle.stack) {
+      middleware.handle.stack.forEach((handler) => {
+        if (handler.route) {
+          const methods = Object.keys(handler.route.methods)
+            .filter((m) => handler.route.methods[m])
+            .map((m) => m.toUpperCase());
+          routes.push({ methods, path: handler.route.path });
+        }
+      });
+    }
+  });
+  res.json({ ok: true, routes });
+});
+
+// ---------- /v1/compare ----------
+/**
+ * POST /v1/compare
+ * Body:
+ * {
+ *   "provider": "openai" | "claude" | "gemini",
+ *   "prompt": "texto a comparar",
+ *   "model": "opcional (sobrescribe por defecto)",
+ *   "temperature": 0.0 - 1.0 (opcional)
+ * }
+ */
+app.post("/v1/compare", async (req, res) => {
   try {
-    const tasks = models.map(async (m) => {
-      switch (m) {
-        case 'openai':
-          return ['openai', await callOpenAI(prompt, temperature)];
-        case 'claude':
-          return ['claude', await callClaude(prompt, temperature)];
-        case 'gemini':
-          return ['gemini', await callGemini(prompt, temperature)];
-        default:
-          return [m, '(modelo desconocido)'];
+    const { provider, prompt, model, temperature } = req.body || {};
+    if (!provider || !PROVIDERS.includes(String(provider).toLowerCase())) {
+      return httpError(res, 400, `provider inválido. Usa: ${PROVIDERS.join(", ")}`);
+    }
+    if (!prompt || typeof prompt !== "string") {
+      return httpError(res, 400, "prompt requerido (string)");
+    }
+
+    const selectedModel = pickModel(String(provider).toLowerCase(), model);
+    const temp = typeof temperature === "number" ? temperature : 0.2;
+
+    const controller = new AbortController();
+    const t0 = getNowMs();
+
+    try {
+      const result = await withTimeout(
+        callProvider({
+          provider,
+          prompt,
+          model: selectedModel,
+          temperature: temp,
+          signal: controller.signal,
+        }),
+        30000,
+        controller
+      );
+
+      const latencyMs = Math.round(getNowMs() - t0);
+      return res.json({
+        ok: true,
+        provider: String(provider).toLowerCase(),
+        model: selectedModel,
+        latencyMs,
+        output: result.output,
+        usage: result.usage ?? null,
+      });
+    } catch (err) {
+      return httpError(res, 502, `Error llamando a ${provider}: ${(err && err.message) || err}`);
+    }
+  } catch (e) {
+    return httpError(res, 500, "Error interno en /v1/compare", { detail: String(e?.message || e) });
+  }
+});
+
+// ---------- /v1/compare-multi ----------
+/**
+ * POST /v1/compare-multi
+ * Body:
+ * {
+ *   "providers": ["openai","claude","gemini"],   // mínimo 1
+ *   "prompt": "texto",
+ *   "perProviderOptions": {                      // opcional
+ *      "openai": { "model": "...", "temperature": 0.3 },
+ *      "claude": { "model": "...", "temperature": 0.2 },
+ *      "gemini": { "model": "...", "temperature": 0.1 }
+ *   }
+ * }
+ */
+app.post("/v1/compare-multi", async (req, res) => {
+  try {
+    const { providers, prompt, perProviderOptions } = req.body || {};
+
+    if (!Array.isArray(providers) || providers.length === 0) {
+      return httpError(res, 400, "providers requerido (array con al menos un proveedor)");
+    }
+    const normalized = providers.map((p) => String(p).toLowerCase()).filter((p) => PROVIDERS.includes(p));
+    if (normalized.length === 0) {
+      return httpError(res, 400, `providers inválidos. Soportados: ${PROVIDERS.join(", ")}`);
+    }
+    if (!prompt || typeof prompt !== "string") {
+      return httpError(res, 400, "prompt requerido (string)");
+    }
+
+    const controller = new AbortController();
+    const t0 = getNowMs();
+
+    const tasks = normalized.map(async (p) => {
+      const opts = (perProviderOptions && perProviderOptions[p]) || {};
+      const model = pickModel(p, opts.model);
+      const temperature = typeof opts.temperature === "number" ? opts.temperature : 0.2;
+
+      const pStart = getNowMs();
+      try {
+        const result = await withTimeout(
+          callProvider({ provider: p, prompt, model, temperature, signal: controller.signal }),
+          35000,
+          controller
+        );
+        return {
+          ok: true,
+          provider: p,
+          model,
+          latencyMs: Math.round(getNowMs() - pStart),
+          output: result.output,
+          usage: result.usage ?? null,
+        };
+      } catch (err) {
+        return {
+          ok: false,
+          provider: p,
+          model,
+          latencyMs: Math.round(getNowMs() - pStart),
+          error: (err && err.message) || String(err),
+        };
       }
     });
 
-    const entries = await Promise.all(tasks);
-    const outputs = Object.fromEntries(entries);
-    return res.json({ outputs, quota: { remaining: getRemaining(installId) } });
-  } catch (err) {
-    console.error(err);
-    return res.status(500).send('Server error');
+    const results = await Promise.all(tasks);
+    const totalMs = Math.round(getNowMs() - t0);
+
+    return res.json({ ok: true, totalLatencyMs: totalMs, results });
+  } catch (e) {
+    return httpError(res, 500, "Error interno en /v1/compare-multi", { detail: String(e?.message || e) });
   }
 });
 
-// Comparativa SINGLE
-app.post('/v1/compare', async (req, res) => {
-  const installId = getInstallId(req);
-  if (!installId) return res.status(400).json({ error: 'Missing X-Install-ID header' });
+// ---------- 404 y manejador de errores ----------
+app.use((_req, res) => httpError(res, 404, "Ruta no encontrada"));
+app.use((err, _req, res, _next) => httpError(res, 500, "Error no controlado", { detail: String(err?.message || err) }));
 
-  const limit = consumePoint(installId);
-  if (limit.limited) return res.status(429).json({ error: 'Free daily limit reached', quota: { remaining: 0 } });
-
-  const { prompt, model, temperature } = req.body || {};
-  if (!prompt || !model) return res.status(400).json({ error: 'prompt and model required' });
-
-  try {
-    let out = '';
-    if (model === 'openai') out = await callOpenAI(prompt, temperature);
-    else if (model === 'claude') out = await callClaude(prompt, temperature);
-    else if (model === 'gemini') out = await callGemini(prompt, temperature);
-    else return res.status(400).json({ error: 'unknown model' });
-
-    return res.json({ output: out, quota: { remaining: getRemaining(installId) } });
-  } catch (err) {
-    console.error(err);
-    return res.status(500).send('Server error');
-  }
-});
-
-/* ------------------------------ Llamadas IA ------------------------------ */
-
-async function callOpenAI(prompt, temperature = 1) {
-  const key = process.env.OPENAI_API_KEY;
-  if (!key) throw new Error('OPENAI_API_KEY not set');
-
-  const body = {
-    model: 'gpt-4o-mini',
-    messages: [{ role: 'user', content: prompt }],
-    temperature: Number.isFinite(+temperature) ? +temperature : 1
-  };
-
-  const resp = await fetch('https://api.openai.com/v1/chat/completions', {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${key}`,
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify(body)
-  });
-  if (!resp.ok) throw new Error(`OpenAI error ${resp.status}: ${await resp.text()}`);
-  const data = await resp.json();
-  return data.choices?.[0]?.message?.content || '';
-}
-
-async function callClaude(prompt, temperature = 1) {
-  const key = process.env.ANTHROPIC_API_KEY;
-  if (!key) throw new Error('ANTHROPIC_API_KEY not set');
-
-  const body = {
-    model: 'claude-3-haiku-20240307',
-    max_tokens: 512,
-    temperature: Number.isFinite(+temperature) ? +temperature : 1,
-    messages: [{ role: 'user', content: prompt }]
-  };
-
-  const resp = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: {
-      'x-api-key': key,
-      'anthropic-version': '2023-06-01',
-      'content-type': 'application/json'
-    },
-    body: JSON.stringify(body)
-  });
-  if (!resp.ok) throw new Error(`Anthropic error ${resp.status}: ${await resp.text()}`);
-  const data = await resp.json();
-  return data.content?.[0]?.text || '';
-}
-
-async function callGemini(prompt, temperature = 1) {
-  const key = process.env.GOOGLE_API_KEY;
-  if (!key) throw new Error('GOOGLE_API_KEY not set');
-
-  const url =
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${key}`;
-  const body = {
-    contents: [{ parts: [{ text: prompt }] }],
-    generationConfig: { temperature: Number.isFinite(+temperature) ? +temperature : 1 }
-  };
-
-  const resp = await fetch(url, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(body)
-  });
-  if (!resp.ok) throw new Error(`Gemini error ${resp.status}: ${await resp.text()}`);
-  const data = await resp.json();
-  return data.candidates?.[0]?.content?.parts?.[0]?.text || '';
-}
-// --- TEST: POST simple para verificar rutas POST ---
-app.post('/v1/ping', (req, res) => {
-  res.json({ ok: true, got: req.body || null });
-});
-
-/* --------------------------------- Start --------------------------------- */
+// ---------- Inicio ----------
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`API listening on http://localhost:${PORT}`);
+  console.log(`Compare backend escuchando en :${PORT}`);
 });
