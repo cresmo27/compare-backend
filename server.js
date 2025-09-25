@@ -1,18 +1,17 @@
 // server.js
 // Backend ligero para Comparador de IAs
-// Proveedores soportados: openai, claude, gemini
+// Proveedores: openai, claude, gemini. + Streaming SSE para OpenAI
 
 import express from "express";
 import cors from "cors";
 
 // Node 18+ trae fetch y AbortController nativos.
-// Si ejecutas en un entorno sin fetch, descomenta esta línea:
-// const fetch = (await import("node-fetch")).default;
 
 const app = express();
 
 // ---------- Middlewares ----------
-app.use(cors({ origin: true })); // Permite llamadas desde la extensión
+app.use(cors({ origin: true }));
+app.options("*", cors()); // responde preflight CORS
 app.use(express.json({ limit: "1mb" }));
 
 // ---------- Utilidades ----------
@@ -30,7 +29,7 @@ function pickModel(provider, requested) {
 }
 
 function getNowMs() {
-  return performance?.now?.() ?? Date.now();
+  return (typeof performance !== "undefined" && performance.now) ? performance.now() : Date.now();
 }
 
 function httpError(res, code, message, extra = {}) {
@@ -110,7 +109,6 @@ async function callAnthropic({ prompt, model, temperature = 0.2, signal }) {
   }
 
   const data = await res.json();
-  // Claude v1/messages responde con .content como array de bloques
   const output =
     Array.isArray(data?.content)
       ? data.content.map((b) => (typeof b?.text === "string" ? b.text : "")).join("\n")
@@ -129,16 +127,8 @@ async function callGemini({ prompt, model, temperature = 0.2, signal }) {
   )}:generateContent?key=${encodeURIComponent(apiKey)}`;
 
   const body = {
-    contents: [
-      {
-        role: "user",
-        parts: [{ text: prompt }],
-      },
-    ],
-    generationConfig: {
-      temperature,
-      maxOutputTokens: 1024,
-    },
+    contents: [{ role: "user", parts: [{ text: prompt }] }],
+    generationConfig: { temperature, maxOutputTokens: 1024 },
   };
 
   const res = await fetch(url, {
@@ -199,16 +189,47 @@ app.get("/v1/debug-routes", (_req, res) => {
 });
 
 // ---------- /v1/compare ----------
-/**
- * POST /v1/compare
- * Body:
- * {
- *   "provider": "openai" | "claude" | "gemini",
- *   "prompt": "texto a comparar",
- *   "model": "opcional (sobrescribe por defecto)",
- *   "temperature": 0.0 - 1.0 (opcional)
- * }
- */
+app.post("/v1/compare", async (req, res) => {
+  try {
+    const { provider, prompt, model, temperature } = req.body || {};
+    if (!provider || !PROVIDERS.includes(String(provider).toLowerCase())) {
+      return httpError(res, 400, `provider inválido. Usa: ${PROVIDERS.join(", ")}`);
+    }
+    if (!prompt || typeof prompt !== "string") {
+      return httpError(res, 400, "prompt requerido (string)");
+    }
+
+    const selectedModel = pickModel(String(provider).toLowerCase(), model);
+    const temp = typeof temperature === "number" ? temperature : 0.2;
+
+    const controller = new AbortController();
+    const t0 = getNowMs();
+
+    try {
+      const result = await withTimeout(
+        callProvider({ provider, prompt, model: selectedModel, temperature: temp, signal: controller.signal }),
+        30000,
+        controller
+      );
+
+      const latencyMs = Math.round(getNowMs() - t0);
+      return res.json({
+        ok: true,
+        provider: String(provider).toLowerCase(),
+        model: selectedModel,
+        latencyMs,
+        output: result.output,
+        usage: result.usage ?? null,
+      });
+    } catch (err) {
+      return httpError(res, 502, `Error llamando a ${provider}: ${(err && err.message) || err}`);
+    }
+  } catch (e) {
+    return httpError(res, 500, "Error interno en /v1/compare", { detail: String(e?.message || e) });
+  }
+});
+
+// ---------- /v1/compare-multi ----------
 app.post("/v1/compare-multi", async (req, res) => {
   try {
     const { providers, prompt, perProviderOptions } = req.body || {};
@@ -231,9 +252,7 @@ app.post("/v1/compare-multi", async (req, res) => {
       const model = pickModel(p, opts.model);
       const temperature = typeof opts.temperature === "number" ? opts.temperature : 0.2;
 
-      // 👇 AbortController por proveedor (no compartido)
       const controller = new AbortController();
-      // timeouts ligeramente distintos; Gemini a 45s
       const timeoutMs = p === "gemini" ? 45000 : 35000;
 
       const pStart = getNowMs();
@@ -264,82 +283,115 @@ app.post("/v1/compare-multi", async (req, res) => {
 
     const results = await Promise.all(tasks);
     const totalMs = Math.round(getNowMs() - t0);
+
     return res.json({ ok: true, totalLatencyMs: totalMs, results });
   } catch (e) {
     return httpError(res, 500, "Error interno en /v1/compare-multi", { detail: String(e?.message || e) });
   }
 });
 
-
-// ---------- /v1/compare-multi ----------
+// ---------- STREAMING OpenAI: /v1/compare-stream ----------
 /**
- * POST /v1/compare-multi
- * Body:
- * {
- *   "providers": ["openai","claude","gemini"],   // mínimo 1
- *   "prompt": "texto",
- *   "perProviderOptions": {                      // opcional
- *      "openai": { "model": "...", "temperature": 0.3 },
- *      "claude": { "model": "...", "temperature": 0.2 },
- *      "gemini": { "model": "...", "temperature": 0.1 }
- *   }
- * }
+ * POST /v1/compare-stream
+ * Body: { provider: "openai", prompt: string, model?: string, temperature?: number }
+ * Respuesta SSE con eventos:
+ *   event: begin   data: {"model":"..."}
+ *   event: delta   data: {"text":"..."}
+ *   event: done    data: {"latencyMs":1234}
+ *   event: error   data: {"error":"..."}
  */
-app.post("/v1/compare-multi", async (req, res) => {
+app.post("/v1/compare-stream", async (req, res) => {
   try {
-    const { providers, prompt, perProviderOptions } = req.body || {};
-
-    if (!Array.isArray(providers) || providers.length === 0) {
-      return httpError(res, 400, "providers requerido (array con al menos un proveedor)");
-    }
-    const normalized = providers.map((p) => String(p).toLowerCase()).filter((p) => PROVIDERS.includes(p));
-    if (normalized.length === 0) {
-      return httpError(res, 400, `providers inválidos. Soportados: ${PROVIDERS.join(", ")}`);
+    const { provider, prompt, model, temperature } = req.body || {};
+    if (String(provider).toLowerCase() !== "openai") {
+      return httpError(res, 400, "Solo soportado: provider=openai en streaming");
     }
     if (!prompt || typeof prompt !== "string") {
       return httpError(res, 400, "prompt requerido (string)");
     }
 
-    const controller = new AbortController();
+    const apiKey = process.env.OPENAI_API_KEY;
+    if (!apiKey) return httpError(res, 500, "OPENAI_API_KEY no configurada");
+
+    const mdl = pickModel("openai", model);
+    const temp = typeof temperature === "number" ? temperature : 0.2;
+
+    res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+    res.setHeader("Cache-Control", "no-cache, no-transform");
+    res.setHeader("Connection", "keep-alive");
+    res.flushHeaders?.();
+
+    const send = (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+
     const t0 = getNowMs();
+    send("begin", { model: mdl });
 
-    const tasks = normalized.map(async (p) => {
-      const opts = (perProviderOptions && perProviderOptions[p]) || {};
-      const model = pickModel(p, opts.model);
-      const temperature = typeof opts.temperature === "number" ? opts.temperature : 0.2;
+    const url = "https://api.openai.com/v1/chat/completions";
+    const body = {
+      model: mdl,
+      temperature: temp,
+      stream: true,
+      messages: [{ role: "user", content: prompt }],
+    };
 
-      const pStart = getNowMs();
-      try {
-        const result = await withTimeout(
-          callProvider({ provider: p, prompt, model, temperature, signal: controller.signal }),
-          35000,
-          controller
-        );
-        return {
-          ok: true,
-          provider: p,
-          model,
-          latencyMs: Math.round(getNowMs() - pStart),
-          output: result.output,
-          usage: result.usage ?? null,
-        };
-      } catch (err) {
-        return {
-          ok: false,
-          provider: p,
-          model,
-          latencyMs: Math.round(getNowMs() - pStart),
-          error: (err && err.message) || String(err),
-        };
-      }
+    const controller = new AbortController();
+
+    const upstream = await fetch(url, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal,
     });
 
-    const results = await Promise.all(tasks);
-    const totalMs = Math.round(getNowMs() - t0);
+    if (!upstream.ok || !upstream.body) {
+      const text = await upstream.text().catch(() => "");
+      send("error", { error: `OpenAI ${upstream.status}: ${text}` });
+      return res.end();
+    }
 
-    return res.json({ ok: true, totalLatencyMs: totalMs, results });
+    const reader = upstream.body.getReader();
+    const decoder = new TextDecoder("utf-8");
+    let buffer = "";
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+
+      let idx;
+      while ((idx = buffer.indexOf("\n")) >= 0) {
+        const line = buffer.slice(0, idx).trim();
+        buffer = buffer.slice(idx + 1);
+        if (!line) continue;
+        if (line.startsWith("data: ")) {
+          const data = line.slice(6);
+          if (data === "[DONE]") {
+            const latencyMs = Math.round(getNowMs() - t0);
+            send("done", { latencyMs });
+            return res.end();
+          }
+          try {
+            const json = JSON.parse(data);
+            const delta = json?.choices?.[0]?.delta?.content || "";
+            if (delta) send("delta", { text: delta });
+          } catch {
+            // ignora líneas no JSON
+          }
+        }
+      }
+    }
+
+    const latencyMs = Math.round(getNowMs() - t0);
+    send("done", { latencyMs });
+    res.end();
   } catch (e) {
-    return httpError(res, 500, "Error interno en /v1/compare-multi", { detail: String(e?.message || e) });
+    try {
+      res.write(`event: error\ndata: ${JSON.stringify({ error: String(e?.message || e) })}\n\n`);
+    } catch {}
+    res.end();
   }
 });
 
