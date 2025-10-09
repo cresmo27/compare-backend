@@ -47,28 +47,50 @@ app.get("/v1/debug-routes", (_req, res) => {
   res.json({ ok: true, count: routes.length, routes });
 });
 
-// --- ENDPOINT UNIFICADO: compara 3 IAs (simulado)
-// Contrato: POST { prompt: string } → { ok, openai, gemini, claude }
-app.post("/v1/compare-multi", async (req, res, next) => {
+/**
+ * Multi-IA Compare — v1.10.2-surgical-providers-fix (Backend)
+ * Handler de /v1/compare-multi que respeta `providers`.
+ *
+ * Inserta este bloque dentro de tu server.js y elimina el antiguo handler de /v1/compare-multi.
+ * Si usas modo simulado, asegúrate de que runOpenAIorSim / runClaudeorSim / runGeminiorSim
+ * NO se llamen cuando no estén en `want`.
+ */
+
+// Ejemplo de dependencias ya existentes:
+// import express from 'express';
+// const app = express();
+// app.use(express.json());
+
+app.post('/v1/compare-multi', async (req, res) => {
+  const { prompt, providers = [], options = {} } = req.body || {};
+  if (!prompt || typeof prompt !== 'string') {
+    return res.status(400).json({ ok: false, error: 'prompt requerido' });
+  }
+
+  // Si el cliente no manda providers, puedes decidir:
+  //  - Rechazar (400) o
+  //  - Asumir todas (compatibilidad). Aquí asumimos todas PARA NO ROMPER usuarios antiguos.
+  const want = (Array.isArray(providers) && providers.length > 0)
+    ? new Set(providers)
+    : new Set(['openai', 'claude', 'gemini']);
+
+  const out = { ok: true };
+
   try {
-    const { prompt } = req.body || {};
-    if (typeof prompt !== "string" || !prompt.trim()) {
-      return res.status(400).json({ ok: false, code: "BAD_PROMPT", error: "Falta 'prompt' válido." });
+    if (want.has('openai')) {
+      out.openai = await runOpenAIorSim(prompt, options);  // Reutiliza tu función actual
     }
-    if (prompt.length > 8000) {
-      return res.status(413).json({ ok: false, code: "PROMPT_TOO_LARGE", error: "Prompt demasiado largo." });
+    if (want.has('claude')) {
+      out.claude = await runClaudeorSim(prompt, options);
+    }
+    if (want.has('gemini')) {
+      out.gemini = await runGeminiorSim(prompt, options);
     }
 
-    // Simulación (sustituir por llamadas reales cuando toque)
-    const [openai, gemini, claude] = await Promise.all([
-      simulateOpenAI(prompt),
-      simulateGemini(prompt),
-      simulateClaude(prompt),
-    ]);
-
-    res.json({ ok: true, openai, gemini, claude });
+    return res.json(out);
   } catch (err) {
-    next(err);
+    console.error('[compare-multi] error:', err);
+    return res.status(500).json({ ok: false, error: 'internal', detail: String(err) });
   }
 });
 
