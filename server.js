@@ -1,7 +1,8 @@
-// server.js — Multi-IA Compare (v1.10.2-backend-surgical-fix)
-// - Respeta selección de IAs (providers/selectedIAs)
-// - Evita ReferenceError (define runOpenAIOrSim, runClaudeOrSim, runGeminiOrSim)
-// - Modo simulación por defecto (SIMULATE=true) para no romper sin API keys
+// server.js — Multi-IA Compare (v1.11 fusionado)
+// - Mantiene tu estructura original (logging, debug, 404/err handlers, SIMULATE, runners)
+// - Añade soporte de userKeys por proveedor (prioriza la clave del usuario)
+// - Añade espejo de uso /v1/usage/increment (idempotente por requestId)
+// - Enmascara userKeys en logs
 
 import express from "express";
 import cors from "cors";
@@ -56,22 +57,53 @@ app.get("/v1/debug-routes", (_req, res) => {
 });
 
 // =========================================================
+// ==================== Helpers nuevos =====================
+// =========================================================
+
+// Flag de simulación (por defecto true para no romper nada)
+const SIMULATE = String(process.env.SIMULATE ?? "true").toLowerCase() !== "false";
+
+// Defaults de modelos si no se pasan desde el front
+const DEFAULT_MODELS = {
+  openai: "gpt-4o-mini",
+  claude: "claude-3-haiku-20240307",
+  gemini: "gemini-1.5-flash",
+};
+
+function simText(provider, prompt, model, temperature) {
+  const p = (prompt || "").slice(0, 160).replace(/\s+/g, " ").trim();
+  const t = typeof temperature === "number" ? `, temp=${temperature}` : "";
+  return `(${provider}) Modelo: ${model}${t}\n\nRespuesta para: "${p}"\n\n[simulado]`;
+}
+
+// Enmascara userKeys en logs
+function scrub(obj) {
+  if (!obj) return obj;
+  const copy = JSON.parse(JSON.stringify(obj));
+  if (copy.userKeys) {
+    for (const k of Object.keys(copy.userKeys)) copy.userKeys[k] = "***";
+  }
+  return copy;
+}
+
+// Espejo de uso en memoria (si luego quieres Redis/DB es trivial enchufarlo)
+const usageStore = new Map(); // key: `${deviceId}:${date}` -> { openai, claude, gemini, _reqs:Set }
+
+// =========================================================
 // =============  COMPARE MULTI (handlers)  ================
 // =========================================================
 
 /**
- * Entrada esperada (ambas admitidas):
- *  - { prompt, providers: ["openai","claude"], models: {openai:"gpt-4o-mini"}, temperature: 0.2 }
- *  - { prompt, selectedIAs: ["openai","claude"], models: {...}, temperature }
+ * Entrada esperada:
+ *  { prompt, providers | selectedIAs, models, temperature, userKeys?: { openai?, claude?, gemini? } }
  *
  * Salida:
- *  { ok:true, openai: "texto...", claude: "texto..." }  // solo los seleccionados
+ *  { ok:true, openai?: "...", claude?: "...", gemini?: "..." } // solo lo pedido
  *
  * Notas:
- *  - Por compatibilidad: si no llega providers/selectedIAs → asume los 3.
+ *  - userKeys tiene prioridad sobre variables de entorno por proveedor.
  *  - SIMULATE=true (por defecto) → devuelve respuestas simuladas aunque haya API keys.
  */
-
 app.post("/v1/compare-multi", async (req, res) => {
   try {
     const body = req.body || {};
@@ -104,6 +136,9 @@ app.post("/v1/compare-multi", async (req, res) => {
     const temperature =
       typeof body.temperature === "number" ? body.temperature : undefined;
 
+    // Claves personales (prioridad si llegan)
+    const userKeys = body.userKeys || {};
+
     // Mapa de runners (todas DEFINIDAS para evitar ReferenceError)
     const runners = {
       openai: runOpenAIOrSim,
@@ -113,14 +148,31 @@ app.post("/v1/compare-multi", async (req, res) => {
 
     const out = { ok: true };
 
-    // Ejecutar SOLO lo pedido
+    // Ejecutar SOLO lo pedido (con selección de apiKey por proveedor)
     for (const p of want) {
       const fn = runners[p];
       if (!fn) continue; // seguridad
-      const model = models?.[p]; // puede venir undefined → se usa un default
-      out[p] = await fn({ prompt, model, temperature });
+
+      // Selección de apiKey: userKey > env > undefined
+      const apiKey =
+        userKeys[p] ||
+        process.env[
+          p === "openai"
+            ? "OPENAI_API_KEY"
+            : p === "claude"
+            ? "ANTHROPIC_API_KEY"
+            : "GEMINI_API_KEY"
+        ];
+
+      const model = models?.[p]; // puede venir undefined → usa default
+      out[p] = await fn({ prompt, model, temperature, apiKey });
     }
 
+    console.log("[/v1/compare-multi ok]", {
+      id: req.id,
+      providers: want,
+      body: scrub(body),
+    });
     return res.json(out);
   } catch (err) {
     console.error("[/v1/compare-multi] error:", err);
@@ -139,37 +191,22 @@ app.post("/v1/compare-multi", async (req, res) => {
  * Para activar llamadas reales, pon SIMULATE=false y añade la implementación
  * correspondiente (OpenAI/Anthropic/Gemini) más abajo.
  */
-const SIMULATE = String(process.env.SIMULATE ?? "true").toLowerCase() !== "false";
-
-// Defaults de modelos si no se pasan desde el front
-const DEFAULT_MODELS = {
-  openai: "gpt-4o-mini",
-  claude: "claude-3-haiku-20240307",
-  gemini: "gemini-1.5-flash",
-};
-
-function simText(provider, prompt, model, temperature) {
-  const p = (prompt || "").slice(0, 160).replace(/\s+/g, " ").trim();
-  const t =
-    typeof temperature === "number" ? `, temp=${temperature}` : "";
-  return `(${provider}) Modelo: ${model}${t}\n\nRespuesta para: "${p}"\n\n[simulado]`;
-}
 
 // -------- OpenAI --------
-async function runOpenAIOrSim({ prompt, model, temperature }) {
+async function runOpenAIOrSim({ prompt, model, temperature, apiKey }) {
   const useModel = model || DEFAULT_MODELS.openai;
 
-  if (SIMULATE || !process.env.OPENAI_API_KEY) {
+  if (SIMULATE || !apiKey) {
     return simText("OpenAI", prompt, useModel, temperature);
   }
 
-  // IMPLEMENTACIÓN REAL (opcional) — descomentar si la quieres usar:
+  // IMPLEMENTACIÓN REAL (opcional):
   /*
   const resp = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`
+      "Authorization": `Bearer ${apiKey}`
     },
     body: JSON.stringify({
       model: useModel,
@@ -185,20 +222,20 @@ async function runOpenAIOrSim({ prompt, model, temperature }) {
 }
 
 // -------- Claude (Anthropic) --------
-async function runClaudeOrSim({ prompt, model, temperature }) {
+async function runClaudeOrSim({ prompt, model, temperature, apiKey }) {
   const useModel = model || DEFAULT_MODELS.claude;
 
-  if (SIMULATE || !process.env.ANTHROPIC_API_KEY) {
+  if (SIMULATE || !apiKey) {
     return simText("Claude", prompt, useModel, temperature);
   }
 
-  // IMPLEMENTACIÓN REAL (opcional) — descomentar si la quieres usar:
+  // IMPLEMENTACIÓN REAL (opcional):
   /*
   const resp = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "x-api-key": process.env.ANTHROPIC_API_KEY,
+      "x-api-key": apiKey,
       "anthropic-version": "2023-06-01"
     },
     body: JSON.stringify({
@@ -210,23 +247,23 @@ async function runClaudeOrSim({ prompt, model, temperature }) {
   });
   const data = await resp.json();
   if (!resp.ok) throw new Error(`Claude ${resp.status}: ${JSON.stringify(data)}`);
-  const content = Array.isArray(data.content) ? data.content.map(c=>c.text).join("\n") : "";
+  const content = Array.isArray(data.content) ? data.content.map(c=>c.text).join("\\n") : "";
   return content || "(sin contenido)";
   */
   return simText("Claude", prompt, useModel, temperature);
 }
 
 // -------- Gemini --------
-async function runGeminiOrSim({ prompt, model, temperature }) {
+async function runGeminiOrSim({ prompt, model, temperature, apiKey }) {
   const useModel = model || DEFAULT_MODELS.gemini;
 
-  if (SIMULATE || !process.env.GEMINI_API_KEY) {
+  if (SIMULATE || !apiKey) {
     return simText("Gemini", prompt, useModel, temperature);
   }
 
-  // IMPLEMENTACIÓN REAL (opcional) — descomentar si la quieres usar:
+  // IMPLEMENTACIÓN REAL (opcional):
   /*
-  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(useModel)}:generateContent?key=${process.env.GEMINI_API_KEY}`;
+  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(useModel)}:generateContent?key=${apiKey}`;
   const resp = await fetch(endpoint, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -239,11 +276,58 @@ async function runGeminiOrSim({ prompt, model, temperature }) {
   });
   const data = await resp.json();
   if (!resp.ok) throw new Error(`Gemini ${resp.status}: ${JSON.stringify(data)}`);
-  const text = data.candidates?.[0]?.content?.parts?.map(p=>p.text).join("\n");
+  const text = data.candidates?.[0]?.content?.parts?.map(p=>p.text).join("\\n");
   return text || "(sin contenido)";
   */
   return simText("Gemini", prompt, useModel, temperature);
 }
+
+// =========================================================
+// ===============  Espejo de uso (opcional) ===============
+// =========================================================
+
+/**
+ * Body: { deviceId, requestId, increments: {openai, claude, gemini}, date: "YYYY-MM-DD", tz: "Europe/Madrid" }
+ * Idempotente por requestId.
+ */
+app.post("/v1/usage/increment", (req, res) => {
+  try {
+    const { deviceId, requestId, increments, date } = req.body || {};
+    if (!deviceId || !requestId || !date || typeof increments !== "object") {
+      return res.status(400).json({ ok: false, error: "bad_request" });
+    }
+    const key = `${deviceId}:${date}`;
+    const cur =
+      usageStore.get(key) || { openai: 0, claude: 0, gemini: 0, _reqs: new Set() };
+
+    if (cur._reqs.has(requestId)) {
+      return res.json({
+        ok: true,
+        dedup: true,
+        openai: cur.openai,
+        claude: cur.claude,
+        gemini: cur.gemini,
+      });
+    }
+
+    cur._reqs.add(requestId);
+    for (const p of ["openai", "claude", "gemini"]) {
+      const add = Number(increments?.[p] || 0);
+      if (Number.isFinite(add) && add > 0) cur[p] += add;
+    }
+    usageStore.set(key, cur);
+
+    res.json({
+      ok: true,
+      openai: cur.openai,
+      claude: cur.claude,
+      gemini: cur.gemini,
+    });
+  } catch (err) {
+    console.error("[/v1/usage/increment] error:", err);
+    res.status(500).json({ ok: false, error: "internal" });
+  }
+});
 
 // =========================================================
 
