@@ -1,40 +1,61 @@
-// Rate limit muy simple en memoria (token+ip)
-// Producción real: usa Redis si necesitas persistencia entre instancias.
-const buckets = new Map();
+// src/middleware/rateLimit.js
+import { requestHasRealPower } from "./proGuard.js";
 
-const {
-  RATE_LIMIT_WINDOW_MS = "60000",
-  RATE_LIMIT_MAX = "60",
-} = process.env;
+/**
+ * Límite gratis diario (por deviceId o IP). Se ignora cuando:
+ * - body.mode === "real"  Y
+ * - (req.auth.pro === true  O  header 'X-User-Providers' no vacío)
+ *
+ * Config:
+ *   FREE_DAILY_LIMIT=9   (por defecto 9)
+ */
+const FREE_DAILY_LIMIT = Number(process.env.FREE_DAILY_LIMIT || 9);
 
-export function rateLimitReal(req, res, next) {
-  const windowMs = parseInt(RATE_LIMIT_WINDOW_MS, 10);
-  const max = parseInt(RATE_LIMIT_MAX, 10);
+// memoria (simple) con expiración diaria
+const buckets = new Map(); // key -> { count, resetAt }
 
-  const ip = req.headers["x-forwarded-for"]?.toString().split(",")[0]?.trim() || req.ip || "ip";
-  const token = (req.headers.authorization || "").replace(/^Bearer\s+/i, "") || "no-token";
-  const key = `${token}:${ip}`;
+function todayResetAt() {
+  // resetea a las 00:00:00 del día siguiente (UTC)
+  const now = new Date();
+  const reset = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1, 0, 0, 0, 0));
+  return reset.getTime();
+}
 
-  const now = Date.now();
-  const bucket = buckets.get(key) || { count: 0, reset: now + windowMs };
+function keyFromReq(req) {
+  const dev = req.headers["x-device-id"] || req.headers["X-Device-Id"];
+  // si no hay deviceId, usamos ip (Render suele poner x-forwarded-for)
+  const ip =
+    (req.headers["x-forwarded-for"] || "").split(",")[0].trim() ||
+    req.socket?.remoteAddress ||
+    "unknown";
+  return String(dev || ip || "unknown");
+}
 
-  if (now > bucket.reset) {
-    bucket.count = 0;
-    bucket.reset = now + windowMs;
+export function rateLimit(req, res, next) {
+  // ⛳️ BYPASS: REAL con PRO o claves propias
+  if (requestHasRealPower(req)) {
+    return next();
   }
 
-  bucket.count += 1;
-  buckets.set(key, bucket);
+  const key = keyFromReq(req);
+  const now = Date.now();
+  let b = buckets.get(key);
 
-  if (bucket.count > max) {
-    const retrySecs = Math.ceil((bucket.reset - now) / 1000);
+  if (!b || now >= b.resetAt) {
+    b = { count: 0, resetAt: todayResetAt() };
+    buckets.set(key, b);
+  }
+
+  if (b.count >= FREE_DAILY_LIMIT) {
     return res.status(429).json({
       ok: false,
-      code: "RATE_LIMITED",
-      retryAfter: retrySecs,
-      message: "Has alcanzado el límite temporal de uso en Modo Real. Inténtalo más tarde.",
+      code: "LIMIT_REACHED",
+      message: "Límite diario alcanzado (servidor)",
+      resetAt: b.resetAt,
+      freeDailyLimit: FREE_DAILY_LIMIT,
     });
   }
 
+  b.count += 1;
   next();
 }
