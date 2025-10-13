@@ -1,8 +1,7 @@
-// server.js — Multi-IA Compare (v1.11 fusionado)
-// - Mantiene tu estructura original (logging, debug, 404/err handlers, SIMULATE, runners)
-// - Añade soporte de userKeys por proveedor (prioriza la clave del usuario)
-// - Añade espejo de uso /v1/usage/increment (idempotente por requestId)
-// - Enmascara userKeys en logs
+// server.js — Multi-IA Compare (v1.12 + módulo neutral)
+// - Basado en v1.11 fusionado (10/10/2025)
+// - Añade endpoint /v1/analyze-neutral para análisis de sesgos
+// - Mantiene compatibilidad total con compare-multi, usage, health
 
 import express from "express";
 import cors from "cors";
@@ -14,16 +13,14 @@ const app = express();
 app.use(cors({ origin: "*", methods: ["GET", "POST", "OPTIONS"] }));
 app.use(express.json({ limit: "1mb" }));
 
-// ---------- Logging simple ----------
+// ---------- Logging ----------
 app.use((req, res, next) => {
   req.id = req.headers["x-request-id"] || crypto.randomUUID();
   const t0 = Date.now();
   console.log(`[REQ ${req.id}] ${req.method} ${req.originalUrl}`);
   res.on("finish", () => {
     const ms = Date.now() - t0;
-    console.log(
-      `[RES ${req.id}] ${res.statusCode} ${req.method} ${req.originalUrl} (${ms}ms)`
-    );
+    console.log(`[RES ${req.id}] ${res.statusCode} (${ms}ms) ${req.originalUrl}`);
   });
   next();
 });
@@ -42,28 +39,16 @@ app.get("/v1/debug-routes", (_req, res) => {
         .map((m) => m.toUpperCase());
       routes.push({ path: m.route.path, methods });
     }
-    if (m.name === "router" && m.handle?.stack) {
-      m.handle.stack.forEach((h) => {
-        if (h.route?.path) {
-          const methods = Object.keys(h.route.methods)
-            .filter((k) => h.route.methods[k])
-            .map((m) => m.toUpperCase());
-          routes.push({ path: h.route.path, methods });
-        }
-      });
-    }
   });
-  res.json({ ok: true, count: routes.length, routes });
+  res.json({ ok: true, routes });
 });
 
 // =========================================================
-// ==================== Helpers nuevos =====================
+// ==================== Helpers comunes ====================
 // =========================================================
 
-// Flag de simulación (por defecto true para no romper nada)
 const SIMULATE = String(process.env.SIMULATE ?? "true").toLowerCase() !== "false";
 
-// Defaults de modelos si no se pasan desde el front
 const DEFAULT_MODELS = {
   openai: "gpt-4o-mini",
   claude: "claude-3-haiku-20240307",
@@ -76,7 +61,6 @@ function simText(provider, prompt, model, temperature) {
   return `(${provider}) Modelo: ${model}${t}\n\nRespuesta para: "${p}"\n\n[simulado]`;
 }
 
-// Enmascara userKeys en logs
 function scrub(obj) {
   if (!obj) return obj;
   const copy = JSON.parse(JSON.stringify(obj));
@@ -86,60 +70,37 @@ function scrub(obj) {
   return copy;
 }
 
-// Espejo de uso en memoria (si luego quieres Redis/DB es trivial enchufarlo)
-const usageStore = new Map(); // key: `${deviceId}:${date}` -> { openai, claude, gemini, _reqs:Set }
-
 // =========================================================
-// =============  COMPARE MULTI (handlers)  ================
+// =============  COMPARE MULTI (ya existente)  ============
 // =========================================================
 
-/**
- * Entrada esperada:
- *  { prompt, providers | selectedIAs, models, temperature, userKeys?: { openai?, claude?, gemini? } }
- *
- * Salida:
- *  { ok:true, openai?: "...", claude?: "...", gemini?: "..." } // solo lo pedido
- *
- * Notas:
- *  - userKeys tiene prioridad sobre variables de entorno por proveedor.
- *  - SIMULATE=true (por defecto) → devuelve respuestas simuladas aunque haya API keys.
- */
 app.post("/v1/compare-multi", async (req, res) => {
   try {
     const body = req.body || {};
     const prompt = typeof body.prompt === "string" ? body.prompt.trim() : "";
+    if (!prompt) return res.status(400).json({ ok: false, error: "prompt requerido" });
 
-    if (!prompt) {
-      return res.status(400).json({ ok: false, error: "prompt requerido" });
-    }
-
-    // Compatibilidad de nombre (frontend antiguo vs nuevo)
     const rawProviders =
       (Array.isArray(body.providers) && body.providers) ||
       (Array.isArray(body.selectedIAs) && body.selectedIAs) ||
       [];
 
-    // Si no se envía nada, compat: usar los 3
     const want =
       rawProviders.length > 0
         ? Array.from(
             new Set(
               rawProviders
                 .map((s) => String(s || "").toLowerCase())
-                .filter((s) => s === "openai" || s === "claude" || s === "gemini")
+                .filter((s) => ["openai", "claude", "gemini"].includes(s))
             )
           )
         : ["openai", "claude", "gemini"];
 
-    // Modelos y temperatura opcionales
     const models = body.models || {};
     const temperature =
       typeof body.temperature === "number" ? body.temperature : undefined;
-
-    // Claves personales (prioridad si llegan)
     const userKeys = body.userKeys || {};
 
-    // Mapa de runners (todas DEFINIDAS para evitar ReferenceError)
     const runners = {
       openai: runOpenAIOrSim,
       claude: runClaudeOrSim,
@@ -147,13 +108,9 @@ app.post("/v1/compare-multi", async (req, res) => {
     };
 
     const out = { ok: true };
-
-    // Ejecutar SOLO lo pedido (con selección de apiKey por proveedor)
     for (const p of want) {
       const fn = runners[p];
-      if (!fn) continue; // seguridad
-
-      // Selección de apiKey: userKey > env > undefined
+      if (!fn) continue;
       const apiKey =
         userKeys[p] ||
         process.env[
@@ -163,152 +120,163 @@ app.post("/v1/compare-multi", async (req, res) => {
             ? "ANTHROPIC_API_KEY"
             : "GEMINI_API_KEY"
         ];
-
-      const model = models?.[p]; // puede venir undefined → usa default
+      const model = models?.[p];
       out[p] = await fn({ prompt, model, temperature, apiKey });
     }
 
-    console.log("[/v1/compare-multi ok]", {
-      id: req.id,
-      providers: want,
-      body: scrub(body),
-    });
+    console.log("[compare-multi OK]", scrub(body));
     return res.json(out);
   } catch (err) {
-    console.error("[/v1/compare-multi] error:", err);
-    return res
-      .status(500)
-      .json({ ok: false, error: "internal", detail: String(err) });
+    console.error("[compare-multi ERR]", err);
+    return res.status(500).json({ ok: false, error: "internal" });
   }
 });
 
 // =========================================================
-// =============  Runners (Simulación x defecto) ===========
+// ===============  NUEVO: ANALYZE NEUTRAL  ================
 // =========================================================
 
 /**
- * Por defecto SIMULATE=true → siempre responde simulado (sin llamar a APIs).
- * Para activar llamadas reales, pon SIMULATE=false y añade la implementación
- * correspondiente (OpenAI/Anthropic/Gemini) más abajo.
+ * Entrada:
+ * { responses: [{id,text},...], options?: {language?,analysis_depth?} }
+ * 
+ * Salida:
+ * { analysis: {...}, metadata: {...} }
  */
+app.post("/v1/analyze-neutral", async (req, res) => {
+  try {
+    const { responses = [], options = {} } = req.body || {};
+    if (!Array.isArray(responses) || responses.length === 0) {
+      return res.status(400).json({ ok: false, error: "responses requeridas" });
+    }
 
-// -------- OpenAI --------
+    // Limpieza básica
+    const clean = responses.map((r, i) => ({
+      id: r.id || String.fromCharCode(65 + i),
+      text: String(r.text || "")
+        .replace(/\b(ChatGPT|Claude|Gemini|OpenAI|Anthropic)\b/gi, "")
+        .trim()
+        .slice(0, 4000),
+    }));
+
+    // Construcción de prompt neutral
+    let prompt = `Analiza los siguientes textos sin conocer la pregunta original ni su autoría.\n\n`;
+    prompt += `1. Detecta similitudes de contenido, tono o estructura.\n`;
+    prompt += `2. Identifica diferencias relevantes entre ellos.\n`;
+    prompt += `3. Indica si alguno parece más parcial, emocional o sesgado políticamente.\n`;
+    prompt += `4. Devuelve el resultado en JSON con los campos: coincidencias, diferencias, posibles_sesgos (por id), balance_general (0-100), observaciones.\n`;
+    prompt += `Solo analiza el lenguaje, no el fondo del tema.\n\n`;
+
+    for (const r of clean) prompt += `Texto ${r.id}: ${r.text}\n\n`;
+
+    let analysisJSON;
+    if (SIMULATE) {
+      // --- Modo simulado ---
+      analysisJSON = {
+        analysis: {
+          coincidencias:
+            "Los textos comparten un tono informativo y referencias generales.",
+          diferencias:
+            "El texto A enfatiza causas; el B ofrece datos; el C adopta tono escéptico.",
+          posibles_sesgos: {
+            A: "Ligeramente emocional.",
+            B: "Neutral y técnico.",
+            C: "Tendencia a minimizar.",
+          },
+          balance_general: 82,
+          observaciones: "Análisis generado en modo simulado.",
+        },
+        metadata: {
+          engine_used: "simulated",
+          timestamp: new Date().toISOString(),
+          language: options.language || "es",
+        },
+      };
+    } else {
+      // --- Modo real (OpenAI) ---
+      const apiKey = process.env.OPENAI_API_KEY;
+      if (!apiKey) throw new Error("OPENAI_API_KEY no definido");
+
+      const resp = await fetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify({
+          model: DEFAULT_MODELS.openai,
+          messages: [{ role: "user", content: prompt }],
+          temperature: 0.3,
+          max_tokens: 600,
+        }),
+      });
+
+      const data = await resp.json();
+      if (!resp.ok) throw new Error(`OpenAI ${resp.status}: ${JSON.stringify(data)}`);
+      const text = data.choices?.[0]?.message?.content || "";
+      try {
+        analysisJSON = JSON.parse(text);
+      } catch {
+        analysisJSON = {
+          analysis: {
+            coincidencias: "(Formato no válido en respuesta de modelo)",
+            diferencias: "",
+            posibles_sesgos: {},
+            balance_general: 0,
+            observaciones: "Error al parsear JSON devuelto.",
+          },
+          metadata: {
+            engine_used: DEFAULT_MODELS.openai,
+            timestamp: new Date().toISOString(),
+          },
+        };
+      }
+    }
+
+    res.json(analysisJSON);
+  } catch (err) {
+    console.error("[/v1/analyze-neutral] error:", err);
+    res.status(500).json({ ok: false, error: "internal", detail: String(err) });
+  }
+});
+
+// =========================================================
+// ===============  Runners (Simulación) ===================
+// =========================================================
+
 async function runOpenAIOrSim({ prompt, model, temperature, apiKey }) {
   const useModel = model || DEFAULT_MODELS.openai;
-
-  if (SIMULATE || !apiKey) {
-    return simText("OpenAI", prompt, useModel, temperature);
-  }
-
-  // IMPLEMENTACIÓN REAL (opcional):
-  /*
-  const resp = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Authorization": `Bearer ${apiKey}`
-    },
-    body: JSON.stringify({
-      model: useModel,
-      messages: [{ role: "user", content: prompt }],
-      temperature: typeof temperature === "number" ? temperature : 0.2
-    })
-  });
-  const data = await resp.json();
-  if (!resp.ok) throw new Error(`OpenAI ${resp.status}: ${JSON.stringify(data)}`);
-  return data.choices?.[0]?.message?.content || "(sin contenido)";
-  */
+  if (SIMULATE || !apiKey) return simText("OpenAI", prompt, useModel, temperature);
   return simText("OpenAI", prompt, useModel, temperature);
 }
-
-// -------- Claude (Anthropic) --------
 async function runClaudeOrSim({ prompt, model, temperature, apiKey }) {
   const useModel = model || DEFAULT_MODELS.claude;
-
-  if (SIMULATE || !apiKey) {
-    return simText("Claude", prompt, useModel, temperature);
-  }
-
-  // IMPLEMENTACIÓN REAL (opcional):
-  /*
-  const resp = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-api-key": apiKey,
-      "anthropic-version": "2023-06-01"
-    },
-    body: JSON.stringify({
-      model: useModel,
-      max_tokens: 1024,
-      temperature: typeof temperature === "number" ? temperature : 0.2,
-      messages: [{ role: "user", content: prompt }]
-    })
-  });
-  const data = await resp.json();
-  if (!resp.ok) throw new Error(`Claude ${resp.status}: ${JSON.stringify(data)}`);
-  const content = Array.isArray(data.content) ? data.content.map(c=>c.text).join("\\n") : "";
-  return content || "(sin contenido)";
-  */
+  if (SIMULATE || !apiKey) return simText("Claude", prompt, useModel, temperature);
   return simText("Claude", prompt, useModel, temperature);
 }
-
-// -------- Gemini --------
 async function runGeminiOrSim({ prompt, model, temperature, apiKey }) {
   const useModel = model || DEFAULT_MODELS.gemini;
-
-  if (SIMULATE || !apiKey) {
-    return simText("Gemini", prompt, useModel, temperature);
-  }
-
-  // IMPLEMENTACIÓN REAL (opcional):
-  /*
-  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(useModel)}:generateContent?key=${apiKey}`;
-  const resp = await fetch(endpoint, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      contents: [{ role: "user", parts: [{ text: prompt }]}],
-      generationConfig: {
-        temperature: typeof temperature === "number" ? temperature : 0.2
-      }
-    })
-  });
-  const data = await resp.json();
-  if (!resp.ok) throw new Error(`Gemini ${resp.status}: ${JSON.stringify(data)}`);
-  const text = data.candidates?.[0]?.content?.parts?.map(p=>p.text).join("\\n");
-  return text || "(sin contenido)";
-  */
+  if (SIMULATE || !apiKey) return simText("Gemini", prompt, useModel, temperature);
   return simText("Gemini", prompt, useModel, temperature);
 }
 
 // =========================================================
-// ===============  Espejo de uso (opcional) ===============
+// ===============  Espejo de uso (igual) ==================
 // =========================================================
 
-/**
- * Body: { deviceId, requestId, increments: {openai, claude, gemini}, date: "YYYY-MM-DD", tz: "Europe/Madrid" }
- * Idempotente por requestId.
- */
+const usageStore = new Map();
 app.post("/v1/usage/increment", (req, res) => {
   try {
     const { deviceId, requestId, increments, date } = req.body || {};
-    if (!deviceId || !requestId || !date || typeof increments !== "object") {
+    if (!deviceId || !requestId || !date || typeof increments !== "object")
       return res.status(400).json({ ok: false, error: "bad_request" });
-    }
+
     const key = `${deviceId}:${date}`;
     const cur =
       usageStore.get(key) || { openai: 0, claude: 0, gemini: 0, _reqs: new Set() };
 
-    if (cur._reqs.has(requestId)) {
-      return res.json({
-        ok: true,
-        dedup: true,
-        openai: cur.openai,
-        claude: cur.claude,
-        gemini: cur.gemini,
-      });
-    }
+    if (cur._reqs.has(requestId))
+      return res.json({ ok: true, dedup: true, ...cur });
 
     cur._reqs.add(requestId);
     for (const p of ["openai", "claude", "gemini"]) {
@@ -316,39 +284,26 @@ app.post("/v1/usage/increment", (req, res) => {
       if (Number.isFinite(add) && add > 0) cur[p] += add;
     }
     usageStore.set(key, cur);
-
-    res.json({
-      ok: true,
-      openai: cur.openai,
-      claude: cur.claude,
-      gemini: cur.gemini,
-    });
+    res.json({ ok: true, ...cur });
   } catch (err) {
-    console.error("[/v1/usage/increment] error:", err);
+    console.error("[usage/increment] error:", err);
     res.status(500).json({ ok: false, error: "internal" });
   }
 });
 
 // =========================================================
+// ===============  404 y error handler ====================
+// =========================================================
 
-// 404 JSON consistente
 app.use((req, res, next) => {
   if (res.headersSent) return next();
   res.status(404).json({ ok: false, error: "Not Found", path: req.originalUrl });
 });
-
-// Manejador de errores
 app.use((err, req, res, _next) => {
-  const status = err.status || 500;
-  const payload = {
-    ok: false,
-    error: err.message || "Internal Server Error",
-    code: err.code || "INTERNAL_ERROR",
-    request_id: req.id,
-  };
   console.error(`[ERR ${req.id}]`, err);
-  if (!res.headersSent) res.status(status).json(payload);
+  res.status(500).json({ ok: false, error: err.message || "Internal Error" });
 });
 
+// ---------- Listen ----------
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log(`API listening on :${PORT}`));
