@@ -3,6 +3,8 @@
 // - Añade endpoint /v1/analyze-neutral para análisis de sesgos
 // - Mantiene compatibilidad total con compare-multi, usage, health
 
+import authRoutes from "./routes/authRoutes.js";
+import { realModeGuard } from "./middleware/realModeGuard.js";
 import express from "express";
 import cors from "cors";
 import crypto from "crypto";
@@ -12,6 +14,8 @@ const app = express();
 // ---------- Config ----------
 app.use(cors({ origin: "*", methods: ["GET", "POST", "OPTIONS"] }));
 app.use(express.json({ limit: "1mb" }));
+app.use("/v1/auth", authRoutes);
+
 
 // ---------- Logging ----------
 app.use((req, res, next) => {
@@ -73,6 +77,8 @@ function scrub(obj) {
 // =========================================================
 // =============  COMPARE MULTI (ya existente)  ============
 // =========================================================
+
+app.use("/v1/compare-multi", realModeGuard);
 
 app.post("/v1/compare-multi", async (req, res) => {
   try {
