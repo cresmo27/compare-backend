@@ -4,18 +4,37 @@
 // - Mantiene compatibilidad total con compare-multi, usage, health
 
 import authRoutes from "./routes/authRoutes.js";
-import { realModeGuard } from "./middleware/realModeGuard.js";
+// import { realModeGuard } from "./middleware/realModeGuard.js"; // ⛔️ Reemplazado por proGuard (ver ruta)
 import express from "express";
 import cors from "cors";
 import crypto from "crypto";
 
+// ✅ Middlewares nuevos (para Modo Real sin capado de límite)
+import { authSoft } from "./middleware/authSoft.js";
+import { rateLimit } from "./middleware/rateLimit.js";
+import { proGuard } from "./middleware/proGuard.js";
+
 const app = express();
 
 // ---------- Config ----------
-app.use(cors({ origin: "*", methods: ["GET", "POST", "OPTIONS"] }));
+app.use(
+  cors({
+    origin: "*",
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: [
+      "Content-Type",
+      "Authorization",
+      "X-Device-Id",
+      "X-User-Providers",
+    ],
+    exposedHeaders: ["Retry-After"],
+  })
+);
 app.use(express.json({ limit: "1mb" }));
 app.use("/v1/auth", authRoutes);
 
+// ✅ Importante: leer JWT si existe ANTES de rate-limit y rutas
+app.use(authSoft);
 
 // ---------- Logging ----------
 app.use((req, res, next) => {
@@ -24,7 +43,9 @@ app.use((req, res, next) => {
   console.log(`[REQ ${req.id}] ${req.method} ${req.originalUrl}`);
   res.on("finish", () => {
     const ms = Date.now() - t0;
-    console.log(`[RES ${req.id}] ${res.statusCode} (${ms}ms) ${req.originalUrl}`);
+    console.log(
+      `[RES ${req.id}] ${res.statusCode} (${ms}ms) ${req.originalUrl}`
+    );
   });
   next();
 });
@@ -78,9 +99,11 @@ function scrub(obj) {
 // =============  COMPARE MULTI (ya existente)  ============
 // =========================================================
 
-app.use("/v1/compare-multi", realModeGuard);
+// ⛔️ Sustituido el guard anterior para controlar correctamente modo real + límite
+// app.use("/v1/compare-multi", realModeGuard);
 
-app.post("/v1/compare-multi", async (req, res) => {
+// ✅ Orden correcto: rateLimit (con bypass si REAL+PRO/keys) → proGuard → handler
+app.post("/v1/compare-multi", rateLimit, proGuard, async (req, res) => {
   try {
     const body = req.body || {};
     const prompt = typeof body.prompt === "string" ? body.prompt.trim() : "";
@@ -313,3 +336,5 @@ app.use((err, req, res, _next) => {
 // ---------- Listen ----------
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log(`API listening on :${PORT}`));
+
+export default app;
