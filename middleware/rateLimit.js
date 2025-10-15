@@ -1,61 +1,41 @@
 // src/middleware/rateLimit.js
-import { requestHasRealPower } from "./proGuard.js";
 
-/**
- * Límite gratis diario (por deviceId o IP). Se ignora cuando:
- * - body.mode === "real"  Y
- * - (req.auth.pro === true  O  header 'X-User-Providers' no vacío)
- *
- * Config:
- *   FREE_DAILY_LIMIT=9   (por defecto 9)
- */
-const FREE_DAILY_LIMIT = Number(process.env.FREE_DAILY_LIMIT || 9);
+// Límite diario SOLO para usuarios Simulados (no PRO y sin claves) o para modo 'sim'.
+// Bypass explícito cuando: mode === 'real' && (isPro || hasKeys).
+const LIMIT_FREE_PER_DAY = parseInt(process.env.FREE_DAILY_LIMIT || "25", 10);
 
-// memoria (simple) con expiración diaria
-const buckets = new Map(); // key -> { count, resetAt }
-
-function todayResetAt() {
-  // resetea a las 00:00:00 del día siguiente (UTC)
-  const now = new Date();
-  const reset = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1, 0, 0, 0, 0));
-  return reset.getTime();
-}
-
-function keyFromReq(req) {
-  const dev = req.headers["x-device-id"] || req.headers["X-Device-Id"];
-  // si no hay deviceId, usamos ip (Render suele poner x-forwarded-for)
-  const ip =
-    (req.headers["x-forwarded-for"] || "").split(",")[0].trim() ||
-    req.socket?.remoteAddress ||
-    "unknown";
-  return String(dev || ip || "unknown");
-}
+// Almacenamiento en memoria por día (suficiente para Render free/low tier)
+const store = new Map();
 
 export function rateLimit(req, res, next) {
-  // ⛳️ BYPASS: REAL con PRO o claves propias
-  if (requestHasRealPower(req)) {
+  const st = req.state || {};
+  const bypass = st.mode === "real" && (st.isPro || st.hasKeys);
+
+  if (bypass) {
+    const reason = st.isPro ? "real+pro" : "real+keys";
+    console.log(`rateLimit> bypass=1 reason=${reason}`);
     return next();
   }
 
-  const key = keyFromReq(req);
-  const now = Date.now();
-  let b = buckets.get(key);
+  // Clave de usuario (protegida para anónimos)
+  const userKey = st.userId || `anon:${req.ip || "0.0.0.0"}`;
+  const dayKey = new Date().toISOString().slice(0, 10).replace(/-/g, "");
+  const key = `${dayKey}:${userKey}`;
 
-  if (!b || now >= b.resetAt) {
-    b = { count: 0, resetAt: todayResetAt() };
-    buckets.set(key, b);
+  const count = (store.get(key) || 0) + 1;
+  store.set(key, count);
+
+  console.log(`rateLimit> bypass=0 key=${key} count=${count}/${LIMIT_FREE_PER_DAY}`);
+
+  if (count > LIMIT_FREE_PER_DAY) {
+    return res.status(429).json({ ok: false, error: "Límite diario alcanzado" });
   }
 
-  if (b.count >= FREE_DAILY_LIMIT) {
-    return res.status(429).json({
-      ok: false,
-      code: "LIMIT_REACHED",
-      message: "Límite diario alcanzado (servidor)",
-      resetAt: b.resetAt,
-      freeDailyLimit: FREE_DAILY_LIMIT,
-    });
-  }
-
-  b.count += 1;
-  next();
+  return next();
 }
+
+// Tarea de limpieza: purga claves de días anteriores cada hora
+setInterval(() => {
+  const today = new Date().toISOString().slice(0, 10).replace(/-/g, "");
+  for (const k of store.keys()) if (!k.startsWith(`${today}:`)) store.delete(k);
+}, 60 * 60 * 1000).unref?.();
