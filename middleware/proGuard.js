@@ -1,35 +1,19 @@
 // src/middleware/proGuard.js
 
-function hasUserProviders(req) {
-  const h = req.headers && (req.headers["x-user-providers"] || req.headers["X-User-Providers"]);
-  if (!h) return false;
-  // cualquier valor no vacío sirve; si quieres, valida lista
-  return String(h).trim().length > 0;
-}
-
-/**
- * Si la petición pide `mode: "real"` pero el usuario NO tiene PRO
- * ni trae X-User-Providers, forzamos `mode: "simulated"`.
- * (No rompe si body no existe.)
- */
+// Si el usuario intenta 'real' sin PRO ni claves, degradamos a 'sim' para proteger la UX.
 export function proGuard(req, _res, next) {
-  const body = req.body || {};
-  const wantsReal = String(body?.mode || "").toLowerCase() === "real";
-  const isPro = !!req.auth?.pro;
-  const userHasKeys = hasUserProviders(req);
+  req.state = req.state || {};
+  const st = req.state;
 
-  if (wantsReal && !(isPro || userHasKeys)) {
-    body.mode = "simulated";
-    req.body = body;
+  if (st.mode === "real" && !(st.isPro || st.hasKeys)) {
+    console.log("proGuard> forcedSim=1 reason=no-permission");
+    st.mode = "sim";
+    // Por compatibilidad con handlers que lean body.mode
+    req.body = req.body || {};
+    req.body.mode = "sim";
+  } else {
+    console.log("proGuard> forcedSim=0");
   }
-  next();
-}
 
-// Export util por si te hace falta en otras piezas (rate-limit)
-export function requestHasRealPower(req) {
-  const body = req.body || {};
-  const wantsReal = String(body?.mode || "").toLowerCase() === "real";
-  const isPro = !!req.auth?.pro;
-  const userHasKeys = hasUserProviders(req);
-  return wantsReal && (isPro || userHasKeys);
+  return next();
 }
