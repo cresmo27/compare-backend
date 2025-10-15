@@ -14,6 +14,8 @@ function hasUserProviders(req) {
  */
 export function proGuard(req, _res, next) {
   const body = req.body || {};
+  // Admin allows real always
+  if (req?.auth?.role === 'admin') { return next(); }
   const wantsReal = String(body?.mode || "").toLowerCase() === "real";
   const isPro = !!req.auth?.pro;
   const userHasKeys = hasUserProviders(req);
@@ -28,6 +30,8 @@ export function proGuard(req, _res, next) {
 // Export util por si te hace falta en otras piezas (rate-limit)
 export function requestHasRealPower(req) {
   const body = req.body || {};
+  // Admin allows real always
+  if (req?.auth?.role === 'admin') { return next(); }
   const wantsReal = String(body?.mode || "").toLowerCase() === "real";
   const isPro = !!req.auth?.pro;
   const userHasKeys = hasUserProviders(req);

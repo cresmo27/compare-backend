@@ -39,6 +39,7 @@ export function rateLimit(req, res, next) {
 
   const key = keyFromReq(req);
   const now = Date.now();
+  if (req?.auth?.role === 'admin') return next();
   let b = buckets.get(key);
 
   if (!b || now >= b.resetAt) {

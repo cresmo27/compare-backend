@@ -11,6 +11,17 @@ const JWT_SECRET = process.env.JWT_SECRET || "change-me";
 export function authSoft(req, _res, next) {
   req.auth = req.auth || null;
 
+  // Admin via header key (dev convenience)
+  try {
+    const adminKeyHeader = req.headers && (req.headers['x-admin-key'] || req.headers['X-Admin-Key']);
+    const ADMIN_KEY = process.env.ADMIN_KEY || "";
+    if (adminKeyHeader && ADMIN_KEY && String(adminKeyHeader) === String(ADMIN_KEY)) {
+      req.auth = req.auth || {};
+      req.auth.role = 'admin';
+      req.auth.pro = true; // treat as pro for gating
+    }
+  } catch {}
+
   try {
     const auth = req.headers?.authorization || "";
     const m = auth.match(/^Bearer\s+(.+)$/i);
@@ -36,3 +47,6 @@ export function authSoft(req, _res, next) {
     return next();
   }
 }
+
+// Convenience flags
+export function isAdmin(req){ return !!(req.auth && req.auth.role === 'admin'); }
