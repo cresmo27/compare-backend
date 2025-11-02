@@ -103,10 +103,9 @@ app.post("/v1/compare-multi", authSoft, rateLimit, proGuard, async (req, res) =>
       ? body.selectedIAs
       : Array.isArray(body.providers)
       ? body.providers
-      : ["openai", "gemini", "claude"];
+      : ["openai","gemini","claude"];
 
-    // Decide sim/real: body.mode tiene prioridad; si no, usa lo que ponga tu authSoft/env
-    const mode = (body.mode || (req.state && req.state.mode) || (process.env.SIMULATE ? "sim" : "real")).toLowerCase();
+    const mode = (body.mode || req.state?.mode || (process.env.SIMULATE ? "sim":"real")).toLowerCase();
     const simulate = (req.simulate === true) || mode === "sim";
 
     if (simulate) {
@@ -114,7 +113,7 @@ app.post("/v1/compare-multi", authSoft, rateLimit, proGuard, async (req, res) =>
       return res.json({
         ok: true,
         mode: "sim",
-        requestId: req.id || ((globalThis.crypto?.randomUUID?.()) || Math.random().toString(36).slice(2)),
+        requestId: req.id || (globalThis.crypto?.randomUUID?.() || Math.random().toString(36).slice(2)),
         providers: selected,
         openai: selected.includes("openai") ? mk("openai") : "",
         gemini: selected.includes("gemini") ? mk("gemini") : "",
@@ -122,11 +121,10 @@ app.post("/v1/compare-multi", authSoft, rateLimit, proGuard, async (req, res) =>
       });
     }
 
-    // REAL (stub compatible mientras pruebas)
     return res.json({
       ok: true,
       mode: "real",
-      requestId: req.id || ((globalThis.crypto?.randomUUID?.()) || Math.random().toString(36).slice(2)),
+      requestId: req.id || (globalThis.crypto?.randomUUID?.() || Math.random().toString(36).slice(2)),
       providers: selected,
       openai: selected.includes("openai") ? "[real:openai] (stub)" : "",
       gemini: selected.includes("gemini") ? "[real:gemini] (stub)" : "",
@@ -134,7 +132,7 @@ app.post("/v1/compare-multi", authSoft, rateLimit, proGuard, async (req, res) =>
     });
   } catch (e) {
     console.error("[compare-multi ERR]", e);
-    return res.status(500).json({ ok: false, error: e?.message || "internal_error" });
+    return res.status(500).json({ ok:false, error: e?.message || "internal_error" });
   }
 });
 
