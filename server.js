@@ -1,5 +1,8 @@
+import fs from "fs";
+import path from "path";
 import express from "express";
 import cors from "cors";
+
 
 const app = express();
 app.use(cors());
@@ -124,6 +127,26 @@ app.post("/v1/compare-multi", authSoft, rateLimit, proGuard, async (req,res)=>{
   }catch(e){
     console.error(`[compare-multi ERR ${req.id}]`, e);
     return res.status(500).json({ ok:false, error: e?.message||"internal_error" });
+  }
+});
+app.get("/__whoami", (req, res) => {
+  try {
+    const cwd = process.cwd();
+    const files = fs.readdirSync(cwd).sort();
+    let serverJs = "";
+    try { serverJs = fs.readFileSync(path.join(cwd, "server.js"), "utf8"); }
+    catch (e) { serverJs = `NO server.js at root: ${e.message}`; }
+
+    res.json({
+      ok: true,
+      cwd,
+      files,                              // Archivos del directorio donde arranca node
+      hasPlaceholder: /placeholder/.test(serverJs),
+      hasSimulado: /\[simulado:/.test(serverJs),
+      serverHead: serverJs.slice(0, 180) // Primeras líneas para reconocer versión
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
 
