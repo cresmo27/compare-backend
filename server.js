@@ -30,7 +30,48 @@ app.use(
     exposedHeaders: ["Retry-After"],
   })
 );
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({ limit: "1mb" })
+
+// === Diagnostic endpoint to inspect middleware state (temporary) ===
+try {
+  const maybeAuthSoft = (typeof authSoft === "function") ? authSoft : (_req, _res, next) => next();
+  const maybeRateLimit = (typeof rateLimit === "function") ? rateLimit : (_req, _res, next) => next();
+  const maybeProGuard = (typeof proGuard === "function") ? proGuard : (_req, _res, next) => next();
+
+  app.get("/__diag/mw", maybeAuthSoft, maybeRateLimit, maybeProGuard, (req, res) => {
+    const redact = (val) => (typeof val === "string" ? (val.length > 12 ? (val[:4] + "…" + val[-4:]) : "****") : val);
+    const hdr = req.headers || {};
+    const auth = hdr["authorization"] || hdr["Authorization"];
+    const providers = hdr["x-user-providers"] || hdr["X-User-Providers"];
+    const mode = hdr["x-mode"] || hdr["X-Mode"];
+
+    const state = (req.state && typeof req.state === "object") ? req.state : {};
+    const info = {
+      ok: true,
+      tag: "__diag/mw",
+      middlewareFlags: {
+        authSoft: !!state.authSoft || !!state.user,
+        rateLimitBypassed: !!state.rateLimitBypassed,
+        proGuard: !!state.proGuard,
+      },
+      state,
+      requestMeta: {
+        hasAuthHeader: !!auth,
+        authPreview: auth ? (typeof auth === "string" and len(auth) > 12 and (auth[:4] + "…" + auth[-4:]) or "****") : None,
+        xUserProviders: providers or null,
+        xMode: mode or null,
+        method: req.method,
+        path: req.path,
+      },
+      note: "Endpoint temporal para diagnóstico; eliminar en v1.14",
+    };
+    res.json(info);
+  });
+} catch (e) {
+  // Silently ignore if app/authSoft/rateLimit/proGuard are not yet defined
+}
+
+);
 app.use("/v1/auth", authRoutes);
 
 // ✅ Importante: leer JWT si existe ANTES de rate-limit y rutas
