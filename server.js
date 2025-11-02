@@ -93,42 +93,51 @@ app.post("/v1/usage/increment", (_req,res)=> res.json({ ok:true }) );
 app.use("/v1/compare-multi", (req,_res,next)=>{ req.routeTag="compare-multi"; next(); });
 
 // === Handler principal ===
-app.post("/v1/compare-multi", authSoft, rateLimit, proGuard, async (req,res)=>{
-  try{
+// Mantén tu orden de middlewares. Aquí asumo: authSoft → rateLimit → proGuard → handler.
+
+app.post("/v1/compare-multi", authSoft, rateLimit, proGuard, async (req, res) => {
+  try {
     const body = req.body || {};
     const prompt = body.prompt || "";
-    const selected = Array.isArray(body.selectedIAs) ? body.selectedIAs
-                    : Array.isArray(body.providers) ? body.providers
-                    : ["openai","gemini","claude"];
+    const selected = Array.isArray(body.selectedIAs)
+      ? body.selectedIAs
+      : Array.isArray(body.providers)
+      ? body.providers
+      : ["openai", "gemini", "claude"];
 
-    if (req.simulate) {
-      const mk = (name)=> `[simulado:${name}] Respuesta breve para: "${String(prompt).slice(0,80)}"`;
+    // Decide sim/real: body.mode tiene prioridad; si no, usa lo que ponga tu authSoft/env
+    const mode = (body.mode || (req.state && req.state.mode) || (process.env.SIMULATE ? "sim" : "real")).toLowerCase();
+    const simulate = (req.simulate === true) || mode === "sim";
+
+    if (simulate) {
+      const mk = (name) => `[simulado:${name}] Respuesta breve para: "${String(prompt).slice(0,80)}"`;
       return res.json({
-        ok:true,
-        mode:"sim",
-        requestId:req.id,
-        providers:selected,
+        ok: true,
+        mode: "sim",
+        requestId: req.id || ((globalThis.crypto?.randomUUID?.()) || Math.random().toString(36).slice(2)),
+        providers: selected,
         openai: selected.includes("openai") ? mk("openai") : "",
         gemini: selected.includes("gemini") ? mk("gemini") : "",
         claude: selected.includes("claude") ? mk("claude") : "",
       });
     }
 
-    // REAL (stub compatible por ahora)
+    // REAL (stub compatible mientras pruebas)
     return res.json({
-      ok:true,
-      mode:"real",
-      requestId:req.id,
-      providers:selected,
+      ok: true,
+      mode: "real",
+      requestId: req.id || ((globalThis.crypto?.randomUUID?.()) || Math.random().toString(36).slice(2)),
+      providers: selected,
       openai: selected.includes("openai") ? "[real:openai] (stub)" : "",
       gemini: selected.includes("gemini") ? "[real:gemini] (stub)" : "",
       claude: selected.includes("claude") ? "[real:claude] (stub)" : "",
     });
-  }catch(e){
-    console.error(`[compare-multi ERR ${req.id}]`, e);
-    return res.status(500).json({ ok:false, error: e?.message||"internal_error" });
+  } catch (e) {
+    console.error("[compare-multi ERR]", e);
+    return res.status(500).json({ ok: false, error: e?.message || "internal_error" });
   }
 });
+
 app.get("/__whoami", (req, res) => {
   try {
     const cwd = process.cwd();
