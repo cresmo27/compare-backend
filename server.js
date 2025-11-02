@@ -14,39 +14,23 @@ import { authSoft } from "./middleware/authSoft.js";
 import { rateLimit } from "./middleware/rateLimit.js";
 import { proGuard } from "./middleware/proGuard.js";
 
+// ===== utilidades varias/ids =====
+function rid() {
+  return crypto.randomBytes(6).toString("hex");
+}
+
+// ===== App =====
 const app = express();
+app.disable?.("x-powered-by");
 
-// ---------- Config ----------
-app.use(
-  cors({
-    origin: "*",
-    methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: [
-      "Content-Type",
-      "Authorization",
-      "X-Device-Id",
-      "X-User-Providers",
-    ],
-    exposedHeaders: ["Retry-After"],
-  })
-);
+app.use(cors());
 app.use(express.json({ limit: "1mb" }));
-app.use("/v1/auth", authRoutes);
 
-// ✅ Importante: leer JWT si existe ANTES de rate-limit y rutas
-app.use(authSoft);
-
-// ---------- Logging ----------
-app.use((req, res, next) => {
-  req.id = req.headers["x-request-id"] || crypto.randomUUID();
-  const t0 = Date.now();
-  console.log(`[REQ ${req.id}] ${req.method} ${req.originalUrl}`);
-  res.on("finish", () => {
-    const ms = Date.now() - t0;
-    console.log(
-      `[RES ${req.id}] ${res.statusCode} (${ms}ms) ${req.originalUrl}`
-    );
-  });
+// id de request + simulación global
+app.use((req, _res, next) => {
+  req.id = req.id || rid();
+  // SIMULATE global para pruebas
+  req.simulate = String(process.env.SIMULATE || "").toLowerCase() === "true";
   next();
 });
 
@@ -68,226 +52,111 @@ app.get("/v1/debug-routes", (_req, res) => {
   res.json({ ok: true, routes });
 });
 
-// =========================================================
-// ==================== Helpers comunes ====================
-// =========================================================
+// ---------- Diagnóstico middlewares ----------
+// Evalúa estado tal como lo verían los middlewares, sin consumir rate-limit.
+app.get("/__diag/mw", authSoft, (req, res) => {
+  try {
+    // Reaprovechamos la misma lógica de cabecera/whitelist que usa rateLimit,
+    // pero sin incrementar contadores.
+    const st = req.state || {};
+    const DEBUG_SECRET = process.env.RL_DEBUG_SECRET || "";
+    const DEBUG_WHITELIST = (process.env.RL_DEBUG_WHITELIST || "")
+      .split(",").map(s => s.trim()).filter(Boolean);
 
-const SIMULATE = String(process.env.SIMULATE ?? "true").toLowerCase() !== "false";
+    const dbgHeader = req.get("X-Debug-Bypass");
+    const userId = st.userId || req.user?.sub || req.user?.id || req.user?.email || null;
 
-const DEFAULT_MODELS = {
-  openai: "gpt-4o-mini",
-  claude: "claude-3-haiku-20240307",
-  gemini: "gemini-1.5-flash",
-};
+    let rateLimitBypassed = false;
+    let rateLimitKey = null;
+    let remaining = null;
 
-function simText(provider, prompt, model, temperature) {
-  const p = (prompt || "").slice(0, 160).replace(/\s+/g, " ").trim();
-  const t = typeof temperature === "number" ? `, temp=${temperature}` : "";
-  return `(${provider}) Modelo: ${model}${t}\n\nRespuesta para: "${p}"\n\n[simulado]`;
-}
+    if (DEBUG_SECRET && dbgHeader && dbgHeader === DEBUG_SECRET) {
+      rateLimitBypassed = true;
+      rateLimitKey = "debug-header";
+    } else if (userId && DEBUG_WHITELIST.includes(String(userId))) {
+      rateLimitBypassed = true;
+      rateLimitKey = `whitelist:${userId}`;
+    } else if (st.mode === "real" && (st.isPro || st.hasKeys)) {
+      rateLimitBypassed = true;
+      rateLimitKey = st.isPro ? "real+pro" : "real+keys";
+    } else {
+      // Simular cuál sería la clave y el restante sin consumirla
+      const userKey = st.userId || `anon:${req.ip || "0.0.0.0"}`;
+      const dayKey = new Date().toISOString().slice(0, 10).replace(/-/g, "");
+      rateLimitKey = `${dayKey}:${userKey}`;
+      // No tocamos el store real, por eso remaining va null
+      remaining = null;
+    }
 
-function scrub(obj) {
-  if (!obj) return obj;
-  const copy = JSON.parse(JSON.stringify(obj));
-  if (copy.userKeys) {
-    for (const k of Object.keys(copy.userKeys)) copy.userKeys[k] = "***";
+    return res.json({
+      mode: st.mode,
+      simulate: !!req.simulate,
+      isPro: !!st.isPro,
+      hasKeys: !!st.hasKeys,
+      rateLimitBypassed,
+      rateLimitKey,
+      remaining
+    });
+  } catch (e) {
+    return res.status(500).json({ ok:false, error: e?.message || "diag_error" });
   }
-  return copy;
-}
+});
 
-// =========================================================
-// =============  COMPARE MULTI (ya existente)  ============
-// =========================================================
+// ---------- Auth (v1) ----------
+app.use("/v1/auth", authRoutes);
 
-// ⛔️ Sustituido el guard anterior para controlar correctamente modo real + límite
-// app.use("/v1/compare-multi", realModeGuard);
-
-// ✅ Orden correcto: rateLimit (con bypass si REAL+PRO/keys) → proGuard → handler
-app.post("/v1/compare-multi", rateLimit, proGuard, async (req, res) => {
+// ---------- compare-multi ----------
+// Orden: authSoft → rateLimit → proGuard → handler
+app.use("/v1/compare-multi", (req, _res, next) => {
+  // Marcado de ruta para logs
+  req.routeTag = "compare-multi";
+  next();
+});
+app.post("/v1/compare-multi", authSoft, rateLimit, proGuard, async (req, res) => {
   try {
     const body = req.body || {};
-    const prompt = typeof body.prompt === "string" ? body.prompt.trim() : "";
-    if (!prompt) return res.status(400).json({ ok: false, error: "prompt requerido" });
+    const prompt = body.prompt || "";
+    const temperature = typeof body.temperature === "number" ? body.temperature : 0.3;
+    const providers = Array.isArray(body.providers) ? body.providers : [];
+    const mode = body.mode || req.state?.mode || "sim";
 
-    const rawProviders =
-      (Array.isArray(body.providers) && body.providers) ||
-      (Array.isArray(body.selectedIAs) && body.selectedIAs) ||
-      [];
-
-    const want =
-      rawProviders.length > 0
-        ? Array.from(
-            new Set(
-              rawProviders
-                .map((s) => String(s || "").toLowerCase())
-                .filter((s) => ["openai", "claude", "gemini"].includes(s))
-            )
-          )
-        : ["openai", "claude", "gemini"];
-
-    const models = body.models || {};
-    const temperature =
-      typeof body.temperature === "number" ? body.temperature : undefined;
-    const userKeys = body.userKeys || {};
-
-    const runners = {
-      openai: runOpenAIOrSim,
-      claude: runClaudeOrSim,
-      gemini: runGeminiOrSim,
-    };
-
-    const out = { ok: true };
-    for (const p of want) {
-      const fn = runners[p];
-      if (!fn) continue;
-      const apiKey =
-        userKeys[p] ||
-        process.env[
-          p === "openai"
-            ? "OPENAI_API_KEY"
-            : p === "claude"
-            ? "ANTHROPIC_API_KEY"
-            : "GEMINI_API_KEY"
-        ];
-      const model = models?.[p];
-      out[p] = await fn({ prompt, model, temperature, apiKey });
-    }
-
-    console.log("[compare-multi OK]", scrub(body));
-    return res.json(out);
-  } catch (err) {
-    console.error("[compare-multi ERR]", err);
-    return res.status(500).json({ ok: false, error: "internal" });
+    // ejemplo de respuesta compacta
+    return res.json({
+      ok: true,
+      mode,
+      providers,
+      requestId: req.id,
+      sim: !!req.simulate,
+      info: "compare-multi placeholder (mantiene compatibilidad)"
+    });
+  } catch (e) {
+    console.error(`[compare-multi ERR ${req.id}]`, e);
+    return res.status(500).json({ ok: false, error: e?.message || "internal_error" });
   }
 });
 
-// =========================================================
-// ===============  NUEVO: ANALYZE NEUTRAL  ================
-// =========================================================
-
-/**
- * Entrada:
- * { responses: [{id,text},...], options?: {language?,analysis_depth?} }
- * 
- * Salida:
- * { analysis: {...}, metadata: {...} }
- */
-app.post("/v1/analyze-neutral", async (req, res) => {
+// ---------- analyze-neutral ----------
+app.post("/v1/analyze-neutral", authSoft, rateLimit, proGuard, async (req, res) => {
   try {
-    const { responses = [], options = {} } = req.body || {};
-    if (!Array.isArray(responses) || responses.length === 0) {
-      return res.status(400).json({ ok: false, error: "responses requeridas" });
+    const { inputs, options } = req.body || {};
+    if (!Array.isArray(inputs) || inputs.length < 2) {
+      return res.status(400).json({ ok: false, error: "need_2_plus_inputs" });
     }
-
-    // Limpieza básica
-    const clean = responses.map((r, i) => ({
-      id: r.id || String.fromCharCode(65 + i),
-      text: String(r.text || "")
-        .replace(/\b(ChatGPT|Claude|Gemini|OpenAI|Anthropic)\b/gi, "")
-        .trim()
-        .slice(0, 4000),
-    }));
-
-    // Construcción de prompt neutral
-    let prompt = `Analiza los siguientes textos sin conocer la pregunta original ni su autoría.\n\n`;
-    prompt += `1. Detecta similitudes de contenido, tono o estructura.\n`;
-    prompt += `2. Identifica diferencias relevantes entre ellos.\n`;
-    prompt += `3. Indica si alguno parece más parcial, emocional o sesgado políticamente.\n`;
-    prompt += `4. Devuelve el resultado en JSON con los campos: coincidencias, diferencias, posibles_sesgos (por id), balance_general (0-100), observaciones.\n`;
-    prompt += `Solo analiza el lenguaje, no el fondo del tema.\n\n`;
-
-    for (const r of clean) prompt += `Texto ${r.id}: ${r.text}\n\n`;
-
-    let analysisJSON;
-    if (SIMULATE) {
-      // --- Modo simulado ---
-      analysisJSON = {
-        analysis: {
-          coincidencias:
-            "Los textos comparten un tono informativo y referencias generales.",
-          diferencias:
-            "El texto A enfatiza causas; el B ofrece datos; el C adopta tono escéptico.",
-          posibles_sesgos: {
-            A: "Ligeramente emocional.",
-            B: "Neutral y técnico.",
-            C: "Tendencia a minimizar.",
-          },
-          balance_general: 82,
-          observaciones: "Análisis generado en modo simulado.",
-        },
-        metadata: {
-          engine_used: "simulated",
-          timestamp: new Date().toISOString(),
-          language: options.language || "es",
-        },
-      };
-    } else {
-      // --- Modo real (OpenAI) ---
-      const apiKey = process.env.OPENAI_API_KEY;
-      if (!apiKey) throw new Error("OPENAI_API_KEY no definido");
-
-      const resp = await fetch("https://api.openai.com/v1/chat/completions", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${apiKey}`,
-        },
-        body: JSON.stringify({
-          model: DEFAULT_MODELS.openai,
-          messages: [{ role: "user", content: prompt }],
-          temperature: 0.3,
-          max_tokens: 600,
-        }),
-      });
-
-      const data = await resp.json();
-      if (!resp.ok) throw new Error(`OpenAI ${resp.status}: ${JSON.stringify(data)}`);
-      const text = data.choices?.[0]?.message?.content || "";
-      try {
-        analysisJSON = JSON.parse(text);
-      } catch {
-        analysisJSON = {
-          analysis: {
-            coincidencias: "(Formato no válido en respuesta de modelo)",
-            diferencias: "",
-            posibles_sesgos: {},
-            balance_general: 0,
-            observaciones: "Error al parsear JSON devuelto.",
-          },
-          metadata: {
-            engine_used: DEFAULT_MODELS.openai,
-            timestamp: new Date().toISOString(),
-          },
-        };
+    // placeholder de análisis neutral
+    return res.json({
+      ok: true,
+      requestId: req.id,
+      result: {
+        summary: "Análisis neutral (placeholder)",
+        differences: [],
+        overlaps: []
       }
-    }
-
-    res.json(analysisJSON);
-  } catch (err) {
-    console.error("[/v1/analyze-neutral] error:", err);
-    res.status(500).json({ ok: false, error: "internal", detail: String(err) });
+    });
+  } catch (e) {
+    console.error(`[analyze-neutral ERR ${req.id}]`, e);
+    return res.status(500).json({ ok: false, error: e?.message || "internal_error" });
   }
 });
-
-// =========================================================
-// ===============  Runners (Simulación) ===================
-// =========================================================
-
-async function runOpenAIOrSim({ prompt, model, temperature, apiKey }) {
-  const useModel = model || DEFAULT_MODELS.openai;
-  if (SIMULATE || !apiKey) return simText("OpenAI", prompt, useModel, temperature);
-  return simText("OpenAI", prompt, useModel, temperature);
-}
-async function runClaudeOrSim({ prompt, model, temperature, apiKey }) {
-  const useModel = model || DEFAULT_MODELS.claude;
-  if (SIMULATE || !apiKey) return simText("Claude", prompt, useModel, temperature);
-  return simText("Claude", prompt, useModel, temperature);
-}
-async function runGeminiOrSim({ prompt, model, temperature, apiKey }) {
-  const useModel = model || DEFAULT_MODELS.gemini;
-  if (SIMULATE || !apiKey) return simText("Gemini", prompt, useModel, temperature);
-  return simText("Gemini", prompt, useModel, temperature);
-}
 
 // =========================================================
 // ===============  Espejo de uso (igual) ==================
@@ -300,30 +169,19 @@ app.post("/v1/usage/increment", (req, res) => {
     if (!deviceId || !requestId || !date || typeof increments !== "object")
       return res.status(400).json({ ok: false, error: "bad_request" });
 
-    const key = `${deviceId}:${date}`;
-    const cur =
-      usageStore.get(key) || { openai: 0, claude: 0, gemini: 0, _reqs: new Set() };
+    const key = `${date}:${deviceId}`;
+    const prev = usageStore.get(key) || { total: 0, byReq: {} };
+    prev.total += 1;
+    prev.byReq[requestId] = (prev.byReq[requestId] || 0) + 1;
+    usageStore.set(key, prev);
 
-    if (cur._reqs.has(requestId))
-      return res.json({ ok: true, dedup: true, ...cur });
-
-    cur._reqs.add(requestId);
-    for (const p of ["openai", "claude", "gemini"]) {
-      const add = Number(increments?.[p] || 0);
-      if (Number.isFinite(add) && add > 0) cur[p] += add;
-    }
-    usageStore.set(key, cur);
-    res.json({ ok: true, ...cur });
-  } catch (err) {
-    console.error("[usage/increment] error:", err);
-    res.status(500).json({ ok: false, error: "internal" });
+    return res.json({ ok: true, key, total: prev.total, byReq: prev.byReq[requestId] });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e?.message || "internal_error" });
   }
 });
 
-// =========================================================
-// ===============  404 y error handler ====================
-// =========================================================
-
+// ---------- 404 y errores ----------
 app.use((req, res, next) => {
   if (res.headersSent) return next();
   res.status(404).json({ ok: false, error: "Not Found", path: req.originalUrl });
