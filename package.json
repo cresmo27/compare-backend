@@ -1,0 +1,17 @@
+{
+  "name": "compare-backend",
+  "version": "1.8.1",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+  "express": "^4.19.2",
+  "cors": "^2.8.5",
+  "jsonwebtoken": "^9.0.2"
+  }
+}
